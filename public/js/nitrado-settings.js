@@ -1,10 +1,24 @@
-/* global document, alert, confirm, fetchWithCsrf */
+/* global document, alert, confirm, fetchWithCsrf, DayZTime */
 
 let currentSettings = null;
 let originalSettings = null;
 let changedSettings = {};
 let currentNaming = null;
 let settingsLoadGeneration = 0;
+const pendingSettingsSaves = new Set();
+
+function settingsContextKey() {
+  const { serviceId, guildId } = selectedServerContext();
+  return JSON.stringify([guildId, serviceId]);
+}
+
+function renderSettingsSaveState() {
+  const busy = pendingSettingsSaves.has(settingsContextKey());
+  document.querySelectorAll('.setting-input').forEach(input => { input.disabled = busy; });
+  document.getElementById('resetBtn').disabled = busy;
+  document.getElementById('saveBtn').disabled = busy;
+  document.getElementById('saveBtn').textContent = busy ? '⏳ Saving...' : '💾 Save All Changes';
+}
 
 document.addEventListener('DOMContentLoaded', function() {
   // Event listeners
@@ -25,6 +39,14 @@ document.addEventListener('DOMContentLoaded', function() {
       const key = event.target.dataset.key;
       const value = event.target.value;
       markChanged(category, key, value);
+    }
+  });
+
+  document.addEventListener('input', function(event) {
+    const { category, key } = event.target.dataset || {};
+    if (event.target.classList.contains('setting-input') && category === 'config' &&
+        ['serverTimeAcceleration', 'serverNightTimeAcceleration'].includes(key)) {
+      markChanged(category, key, event.target.value);
     }
   });
 
@@ -99,6 +121,9 @@ async function loadSettings() {
   originalSettings = null;
   changedSettings = {};
   currentNaming = null;
+  renderSettingsSaveState();
+  renderTimePreview();
+  document.getElementById('settingsContainer').classList.add('hidden');
   document.getElementById('linkSettingsCard')?.classList.add('hidden');
   document.getElementById('playerMapSettingsCard')?.classList.add('hidden');
 
@@ -164,6 +189,24 @@ function renderSettings() {
   renderCategory('general', 'generalSettings');
   renderCategory('config', 'configSettings');
   renderCategory('savegame', 'savegameSettings');
+  renderTimePreview();
+  renderSettingsSaveState();
+}
+
+function renderTimePreview() {
+  const card = document.getElementById('timePreviewCard');
+  if (!card) return;
+  card.classList.toggle('hidden', !originalSettings);
+  const loaded = originalSettings?.config || {};
+  const draft = { ...loaded, ...changedSettings.config };
+  for (const [id, config] of [['timePreviewCurrent', loaded], ['timePreviewDraft', draft]]) {
+    const estimate = originalSettings && DayZTime.estimate(
+      config.serverTimeAcceleration, config.serverNightTimeAcceleration
+    );
+    document.getElementById(id).textContent = !originalSettings ? '' : estimate
+      ? `Day: ${estimate.dayHours.toFixed(1)} h · Night: ${estimate.nightHours.toFixed(1)} h (real time)`
+      : 'Unavailable — both time multipliers must be present, finite and greater than zero.';
+  }
 }
 
 function renderCategory(category, containerId) {
@@ -181,7 +224,10 @@ function renderCategory(category, containerId) {
     const settingDiv = document.createElement('div');
     settingDiv.className = 'bg-gray-700 p-4 rounded-lg';
 
-    const isBoolean = value === 'true' || value === 'false' || value === '0' || value === '1';
+    const isTimeMultiplier = category === 'config' &&
+      ['serverTimeAcceleration', 'serverNightTimeAcceleration'].includes(key);
+    const isBoolean = !isTimeMultiplier &&
+      (value === 'true' || value === 'false' || value === '0' || value === '1');
     const isMultiline = typeof value === 'string' && (value.includes('\r\n') || value.includes('\n') || value.length > 100);
 
     const label = document.createElement('label');
@@ -204,7 +250,8 @@ function renderCategory(category, containerId) {
       input.value = String(value);
     } else {
       input = document.createElement('input');
-      input.type = 'text';
+      input.type = isTimeMultiplier ? 'number' : 'text';
+      if (isTimeMultiplier) input.step = 'any';
       input.value = String(value);
     }
     input.classList.add('bg-gray-600', 'p-2', 'rounded', 'w-full', 'setting-input');
@@ -219,6 +266,7 @@ function renderCategory(category, containerId) {
 }
 
 function markChanged(category, key, newValue) {
+  if (!originalSettings || pendingSettingsSaves.has(settingsContextKey())) return;
   if (!changedSettings[category]) {
     changedSettings[category] = {};
   }
@@ -234,10 +282,11 @@ function markChanged(category, key, newValue) {
     }
   }
 
-  console.log('Changed settings:', changedSettings);
+  renderTimePreview();
 }
 
 function resetChanges() {
+  if (!originalSettings || pendingSettingsSaves.has(settingsContextKey())) return;
   if (confirm('Reset all changes and reload original settings?')) {
     changedSettings = {};
     currentSettings = JSON.parse(JSON.stringify(originalSettings));
@@ -246,6 +295,9 @@ function resetChanges() {
 }
 
 async function saveAllSettings() {
+  const contextKey = settingsContextKey();
+  if (!originalSettings || pendingSettingsSaves.has(contextKey)) return;
+  const saveGeneration = settingsLoadGeneration;
   const select = document.getElementById('serverSelect');
   const serverId = select.value;
 
@@ -269,9 +321,8 @@ async function saveAllSettings() {
     return;
   }
 
-  const saveBtn = document.getElementById('saveBtn');
-  saveBtn.disabled = true;
-  saveBtn.textContent = '⏳ Saving...';
+  pendingSettingsSaves.add(contextKey);
+  renderSettingsSaveState();
 
   try {
     const response = await fetchWithCsrf(`/api/nitrado/settings/${serverId}`, {
@@ -280,6 +331,7 @@ async function saveAllSettings() {
     });
 
     const data = await response.json();
+    if (saveGeneration !== settingsLoadGeneration) return;
 
     if (data.success) {
       alert(`✅ Successfully saved ${data.updated} setting(s)!`);
@@ -289,11 +341,12 @@ async function saveAllSettings() {
       alert('❌ Failed to save settings: ' + (data.error || 'Unknown error'));
     }
   } catch (err) {
+    if (saveGeneration !== settingsLoadGeneration) return;
     console.error('Error saving settings:', err);
     alert('❌ Failed to save settings');
   } finally {
-    saveBtn.disabled = false;
-    saveBtn.textContent = '💾 Save All Changes';
+    pendingSettingsSaves.delete(contextKey);
+    if (contextKey === settingsContextKey()) renderSettingsSaveState();
   }
 }
 

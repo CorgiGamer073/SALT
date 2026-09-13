@@ -6,12 +6,15 @@ const path = require('path');
 const {
   buildEmbed,
   applyChangedOnlineCacheRows,
-  refreshGuildPresence,
   safeEdit,
   selectChangedOnlineCacheRows,
   formatRestartChannelName,
   formatRestartEmbedLabel,
   selectNewestRptStartMs,
+  fetchOnlinePlayers,
+  logMissingOnlinePlayerEvidence,
+  parseShutdownFromLogTail,
+  providerStatusChangeMs,
 } = require('../bot/services/serverStatusService');
 
 function testRestartChannelUsesCountdownLabel() {
@@ -47,6 +50,54 @@ function testNewestRptIsSelectedByEmbeddedTimestamp() {
   assert.strictEqual(selected, Date.parse('2026-08-30T14:03:32.000Z'));
 }
 
+function testUnanchoredFtpShutdownTimeIsRejected() {
+  const serverStartMs = Date.parse('2026-09-13T14:00:00.000Z');
+  const staleTail = '10:29:57 [Shutdown] Shutting down in 300 seconds (5 minutes).\n';
+  assert.strictEqual(
+    parseShutdownFromLogTail(staleTail, serverStartMs),
+    null,
+    'a time-only shutdown line without a current-session BIOS marker must not be projected into another day'
+  );
+}
+
+function testStalePriorSessionFtpShutdownWithBiosMarkerIsRejected() {
+  const serverStartMs = Date.parse('2026-09-13T14:00:00.000Z');
+  const staleTail = [
+    '09:00:02 Connected to BIOS (server registration) with id 11111111-1111-1111-1111-111111111111',
+    '10:29:57 [Shutdown] Shutting down in 300 seconds (5 minutes).',
+  ].join('\n');
+  assert.strictEqual(
+    parseShutdownFromLogTail(staleTail, serverStartMs),
+    null,
+    'a stale BIOS marker must not anchor prior-session shutdown evidence to the next day'
+  );
+}
+
+function testCurrentSessionFtpShutdownTimeUsesBiosAnchor() {
+  const serverStartMs = Date.parse('2026-09-13T14:00:00.000Z');
+  const tail = [
+    '13:59:57 [Shutdown] Shutting down in 300 seconds (5 minutes).',
+    '14:00:02 Connected to BIOS (server registration) with id 11111111-1111-1111-1111-111111111111',
+    '14:29:57 [Shutdown] Shutting down in 1800 seconds (30 minutes).',
+  ].join('\n');
+  assert.strictEqual(
+    parseShutdownFromLogTail(tail, serverStartMs),
+    Date.parse('2026-09-13T14:59:57.000Z')
+  );
+}
+
+function testCurrentSessionFtpShutdownHandlesMidnightRollover() {
+  const serverStartMs = Date.parse('2026-09-13T23:59:50.000Z');
+  const tail = [
+    '23:59:55 Connected to BIOS (server registration) with id 11111111-1111-1111-1111-111111111111',
+    '00:10:00 [Shutdown] Shutting down in 300 seconds (5 minutes).',
+  ].join('\n');
+  assert.strictEqual(
+    parseShutdownFromLogTail(tail, serverStartMs),
+    Date.parse('2026-09-14T00:15:00.000Z')
+  );
+}
+
 function testStatusEmbedContainsLiveRestartCountdown() {
   const restartAtMs = Date.parse('2030-08-31T00:23:43.000Z');
   const epochSeconds = Math.floor(restartAtMs / 1000);
@@ -77,7 +128,138 @@ function testStatusEmbedExplainsUnavailablePlayerNames() {
   ).toJSON();
   const playerField = embed.fields.find(field => field.name.includes('Online Players'));
   assert(playerField, 'online-player field missing from status embed');
-  assert.match(playerField.value, /names unavailable — provider log evidence is delayed or stale/);
+  assert.match(playerField.value, /2 players online — current log evidence unavailable/);
+}
+
+function testStatusEmbedLabelsEstimatedNamesWithLastSeenTimes() {
+  const seenAt = '2030-08-31T00:20:00.000Z';
+  const epochSeconds = Math.floor(Date.parse(seenAt) / 1000);
+  const embed = buildEmbed(
+    'Test Server',
+    {
+      status: 'started',
+      query: { player_current: 2, player_max: 20 },
+      settings: { config: {} },
+    },
+    null,
+    [
+      { gamertag: 'PossiblePlayer', evidence_kind: 'estimated', last_seen_at: seenAt },
+    ]
+  ).toJSON();
+  const playerField = embed.fields.find(field => field.name.includes('Estimated Players'));
+  assert(playerField, 'estimated-player field missing from status embed');
+  assert.match(playerField.value, /not confirmed online/i);
+  assert.match(playerField.value, /PossiblePlayer/);
+  assert.match(playerField.value, new RegExp(`<t:${epochSeconds}:R>`));
+  assert.doesNotMatch(playerField.name, /^.*Online Players/);
+}
+
+async function testOnlinePlayerEvidenceIsExactServerRestartScopedAndCountMatched() {
+  const calls = [];
+  const queryPool = {
+    query: async (sql, params) => {
+      calls.push({ sql, params });
+      return {
+        rows: ['One', 'Two', 'Three'].map((gamertag, index) => ({
+          gamertag,
+          login_at: new Date(params[1].getTime() + index + 1),
+          updated_at: new Date(),
+          evidence_kind: 'authoritative',
+        })),
+      };
+    },
+  };
+  const serverStartedAtMs = Date.now() - 60 * 60 * 1000;
+  const players = await fetchOnlinePlayers(42, null, 3, serverStartedAtMs, queryPool);
+  assert.strictEqual(calls.length, 1);
+  assert.match(calls[0].sql, /cache\.server_id = \$1/);
+  assert.match(calls[0].sql, /cache\.login_at >= \$2/);
+  assert.match(calls[0].sql, /snapshot\.source_observed_at >= \$2/);
+  assert.strictEqual(calls[0].params[0], 42);
+  assert.strictEqual(calls[0].params[1].getTime(), serverStartedAtMs);
+  assert.strictEqual(players.length, 3);
+
+  const mismatchPool = { query: async () => ({ rows: players.slice(0, 2) }) };
+  const mismatched = await fetchOnlinePlayers(43, null, 3, serverStartedAtMs, mismatchPool);
+  assert.deepStrictEqual(mismatched, [], 'a count mismatch must not guess which log-derived names are online');
+
+  const hundredPlayers = Array.from({ length: 100 }, (_, index) => ({
+    gamertag: `Player${index}`,
+    login_at: new Date(serverStartedAtMs + index + 1),
+    updated_at: new Date(),
+    evidence_kind: 'authoritative',
+  }));
+  const overCapacity = await fetchOnlinePlayers(
+    44,
+    null,
+    101,
+    serverStartedAtMs,
+    { query: async () => ({ rows: hundredPlayers }) }
+  );
+  assert.deepStrictEqual(overCapacity, [], 'provider counts above 100 must not be capped into a false match');
+
+  let zeroCountQueries = 0;
+  const zeroCount = await fetchOnlinePlayers(45, null, 0, serverStartedAtMs, {
+    query: async () => { zeroCountQueries += 1; return { rows: players }; },
+  });
+  assert.deepStrictEqual(zeroCount, []);
+  assert.strictEqual(zeroCountQueries, 0, 'zero-player servers must return empty before reading stale names');
+}
+
+async function testOnlinePlayerEvidenceRequiresNormalizedServerStart() {
+  assert.strictEqual(
+    providerStatusChangeMs('1788302121'),
+    1788302121000,
+    'provider Unix-second strings must normalize to milliseconds'
+  );
+
+  let calls = 0;
+  const queryPool = {
+    query: async () => {
+      calls += 1;
+      return { rows: [] };
+    },
+  };
+  await fetchOnlinePlayers(42, null, 3, null, queryPool);
+  assert.strictEqual(calls, 0, 'names must not be queried without a valid server-start boundary');
+}
+
+function testMissingEvidenceWarningsIgnoreEmptyServersAndAreRateLimited() {
+  const messages = [];
+  const logger = { log: message => messages.push(message) };
+  logMissingOnlinePlayerEvidence(50, 0, { logger, nowMs: 1000 });
+  assert.deepStrictEqual(messages, [], 'zero-player servers must not emit missing-name warnings');
+
+  logMissingOnlinePlayerEvidence(51, 2, { logger, nowMs: 1000 });
+  logMissingOnlinePlayerEvidence(51, 2, { logger, nowMs: 2000 });
+  assert.strictEqual(messages.length, 1, 'the same evidence delay must be rate-limited');
+  assert.match(messages[0], /server_db_id=51/);
+  assert.match(messages[0], /current exact-server log evidence is unavailable/);
+
+  logMissingOnlinePlayerEvidence(51, 2, { logger, nowMs: 16 * 60 * 1000 });
+  assert.strictEqual(messages.length, 2, 'a persistent delay should remain periodically visible');
+
+  logMissingOnlinePlayerEvidence(52, 2, { logger, nowMs: 1000 });
+  logMissingOnlinePlayerEvidence(52, 0, { logger, nowMs: 2000 });
+  logMissingOnlinePlayerEvidence(52, 1, { logger, nowMs: 3000 });
+  assert.strictEqual(messages.length, 4, 'an empty interval must reset warning suppression');
+}
+
+function testOnlineCacheUsesTheCurrentAdmGamertag() {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'routes', 'logParser.js'),
+    'utf8'
+  );
+  const cacheWriter = source.slice(
+    source.indexOf('async function updateOnlineCache'),
+    source.indexOf('async function refreshPlayerServerActivityForIdentity')
+  );
+  assert.match(cacheWriter, /String\(session\.playerGamertag \|\| ''\)\.trim\(\)/);
+  assert.doesNotMatch(
+    cacheWriter,
+    /SELECT gamertag FROM player_gamertags/,
+    'online names must come from current ADM evidence, not historical aliases'
+  );
 }
 
 function testStatusPlayerNamesRequireFreshProviderEvidence() {
@@ -124,23 +306,14 @@ function testOnlineCacheChangesSelectOnlyExactChangedServers() {
   );
 }
 
-function testStatusLoopWatchesPublishedOnlineCacheEveryThirtySeconds() {
+function testStatusLoopRefreshesProviderEvidenceForChangedCache() {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'bot', 'services', 'serverStatusService.js'),
     'utf8'
   );
   assert.match(source, /const CACHE_REFRESH_INTERVAL_MS = 30 \* 1000/);
   assert.match(source, /server_online_cache_snapshots/);
-  assert.match(source, /row => refreshGuildPresence\(client, row\)/);
-  const presenceRefreshSource = source.slice(
-    source.indexOf('async function refreshGuildPresence'),
-    source.indexOf('/**\n * Runs one full update pass')
-  );
-  assert.doesNotMatch(
-    presenceRefreshSource,
-    /fetchServerData|fetchNextRestart|fetchRestartFromXml/,
-    'a cache change must not poll the provider or fan out through the all-server refresh path'
-  );
+  assert.match(source, /row => updateGuild\(client, row, \{ updateVoiceChannels: false \}\)/);
   assert.match(source, /setInterval\(\(\) => refreshStatusOnOnlineCacheChange\(client\), CACHE_REFRESH_INTERVAL_MS\)/);
 }
 
@@ -178,82 +351,86 @@ async function testCacheGenerationAcknowledgementRequiresExactServerSuccess() {
   assert.strictEqual(generations.get('4'), '1');
 }
 
-async function testCacheRefreshEditsFromLocalStateWithoutProviderCalls() {
-  let editedEmbed = null;
-  let playerFetches = 0;
-  const client = {
-    channels: {
-      fetch: async channelId => {
-        assert.strictEqual(channelId, 'status-channel');
-        return {
-          guildId: 'discord-guild',
-          messages: {
-            fetch: async messageId => {
-              assert.strictEqual(messageId, 'status-message');
-              return {
-                edit: async payload => { editedEmbed = payload.embeds[0]; },
-              };
-            },
-          },
-        };
-      },
-    },
-  };
-  const row = {
-    server_db_id: 3,
-    discord_guild_id: 'discord-guild',
-    config: JSON.stringify({
-      text_channel_id: 'status-channel',
-      pinned_message_id: 'status-message',
-    }),
-  };
-  const renderCache = new Map([['3', {
-    serverName: 'Exact Server',
-    gameserver: { query: { player_current: 1, player_max: 10 }, status: 'started' },
-    restartLabel: null,
-    restartAtMs: null,
-    lastLogSyncTime: null,
-    nextLogSyncTime: null,
-  }]]);
 
-  const updated = await refreshGuildPresence(client, row, {
-    renderCache,
-    fetchPlayers: async serverId => {
-      playerFetches += 1;
-      assert.strictEqual(serverId, 3);
-      return [{ gamertag: 'FreshPlayer' }];
-    },
-  });
+function statusTimeLines(settings, onlinePlayers) {
+  const embed = buildEmbed('Test Server', {
+    status: 'started', query: {}, settings,
+  }, null, onlinePlayers).toJSON();
+  const field = embed.fields.find(item => item.name.includes('Server Settings'));
+  assert(field, 'server settings missing from real embed');
+  return field.value.split('\n').filter(line => /Day Speed|Night Speed|stacked/.test(line));
+}
 
-  assert.strictEqual(updated, true);
-  assert.strictEqual(playerFetches, 1);
-  assert(editedEmbed, 'the cached provider state should render a fresh player list');
-  assert.match(JSON.stringify(editedEmbed), /FreshPlayer/);
+function testStatusEmbedPreservesNormalDayNightFormatting() {
+  for (const players of [[], [{ gamertag: 'TestPlayer' }]]) {
+    for (const [day, night] of [[2, 4], ['2.0', '4.0'], [' 2 ', '4']]) {
+      assert.deepStrictEqual(statusTimeLines({ config: {
+        serverTimeAcceleration: day, serverNightTimeAcceleration: night,
+      } }, players), [
+        ' Day Speed　　　　2× (~6.0 hrs)',
+        ' Night Speed　　　8× eff. (~1.5 hrs)',
+        '　　2× day + 4× night stacked — varies by season',
+      ]);
+    }
+    assert.deepStrictEqual(statusTimeLines({ config: {
+      serverTimeAcceleration: '7', serverNightTimeAcceleration: '3',
+    } }, players), [
+      ' Day Speed　　　　7× (~1.7 hrs)',
+      ' Night Speed　　　21× eff. (~0.6 hrs)',
+      '　　7× day + 3× night stacked — varies by season',
+    ]);
+  }
+}
 
-  const missingMessage = await refreshGuildPresence(client, {
-    ...row,
-    config: JSON.stringify({ text_channel_id: 'status-channel' }),
-  }, {
-    renderCache,
-    fetchPlayers: async () => { throw new Error('must not fetch without a message target'); },
-  });
-  assert.strictEqual(missingMessage, false);
+function testStatusEmbedShowsUnknownForMissingOrInvalidDayNightSettings() {
+  const invalid = [
+    undefined, null, '', ' \t', true, false, [], [2], {}, 0, -2, NaN, Infinity,
+    '2x', '0x10', '0b10', '0o10', '2 4', '1e309', '1e-999',
+  ];
+  const settingsCases = [undefined, null, {}, { config: null }, { config: {} }];
+  for (const value of invalid) {
+    settingsCases.push(
+      { config: { serverTimeAcceleration: value, serverNightTimeAcceleration: 4 } },
+      { config: { serverTimeAcceleration: 2, serverNightTimeAcceleration: value } }
+    );
+  }
+  for (const [day, night] of [[Number.MAX_VALUE, 2], [1e-200, 1e-200], [Number.MIN_VALUE, 1], [1, Number.MIN_VALUE]]) {
+    settingsCases.push({ config: { serverTimeAcceleration: day, serverNightTimeAcceleration: night } });
+  }
+  for (const players of [[], [{ gamertag: 'TestPlayer' }]]) {
+    for (const settings of settingsCases) {
+      assert.deepStrictEqual(statusTimeLines(settings, players), [
+        ' Day Speed　　　　Unknown',
+        ' Night Speed　　　Unknown',
+      ], 'invalid or absent configuration must not invent default speeds or hours');
+    }
+  }
 }
 
 async function main() {
+  testStatusEmbedPreservesNormalDayNightFormatting();
+  testStatusEmbedShowsUnknownForMissingOrInvalidDayNightSettings();
   testRestartChannelUsesCountdownLabel();
   testRestartChannelDoesNotShowAnExpiredTime();
   testRestartEmbedUsesDiscordLiveTimestamp();
   testNewestRptIsSelectedByEmbeddedTimestamp();
+  testUnanchoredFtpShutdownTimeIsRejected();
+  testStalePriorSessionFtpShutdownWithBiosMarkerIsRejected();
+  testCurrentSessionFtpShutdownTimeUsesBiosAnchor();
+  testCurrentSessionFtpShutdownHandlesMidnightRollover();
   testStatusEmbedContainsLiveRestartCountdown();
   testStatusEmbedExplainsUnavailablePlayerNames();
+  testStatusEmbedLabelsEstimatedNamesWithLastSeenTimes();
+  await testOnlinePlayerEvidenceIsExactServerRestartScopedAndCountMatched();
+  await testOnlinePlayerEvidenceRequiresNormalizedServerStart();
+  testMissingEvidenceWarningsIgnoreEmptyServersAndAreRateLimited();
+  testOnlineCacheUsesTheCurrentAdmGamertag();
   testStatusPlayerNamesRequireFreshProviderEvidence();
   testAllUserFacingOnlineListsRequireFreshProviderEvidence();
   testOnlineCacheChangesSelectOnlyExactChangedServers();
-  testStatusLoopWatchesPublishedOnlineCacheEveryThirtySeconds();
+  testStatusLoopRefreshesProviderEvidenceForChangedCache();
   await testSafeEditOnlyAcknowledgesSuccessfulDiscordEdits();
   await testCacheGenerationAcknowledgementRequiresExactServerSuccess();
-  await testCacheRefreshEditsFromLocalStateWithoutProviderCalls();
   console.log('✅ Restart timer accuracy tests passed');
 }
 

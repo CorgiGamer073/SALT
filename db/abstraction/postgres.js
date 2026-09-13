@@ -56,6 +56,65 @@ class PostgreSQLAdapter {
   }
 
   /**
+   * Try to hold process-independent advisory locks on exact integer resources.
+   * The returned handle must be released after the entire provider-to-parser operation.
+   */
+  async acquireSessionAdvisoryLocks(namespace, resourceIds) {
+    if (!this.pool) throw new Error('Database is not connected');
+    const lockNamespace = Number(namespace);
+    const ids = [...new Set(resourceIds.map(Number))].sort((left, right) => left - right);
+    if (!Number.isSafeInteger(lockNamespace)
+      || lockNamespace < -0x80000000
+      || lockNamespace > 0x7fffffff
+      || ids.length === 0
+      || ids.some(id => !Number.isSafeInteger(id) || id < -0x80000000 || id > 0x7fffffff)) {
+      throw new Error('PostgreSQL advisory lock keys must be signed 32-bit integers');
+    }
+
+    const client = await this.pool.connect();
+    const acquired = [];
+    let released = false;
+    const unlock = async () => {
+      if (released) return;
+      released = true;
+      let cleanupError = null;
+      for (const id of acquired.reverse()) {
+        try {
+          const result = await client.query(
+            'SELECT pg_advisory_unlock($1, $2) AS unlocked',
+            [lockNamespace, id]
+          );
+          if (result.rows[0]?.unlocked !== true) {
+            if (!cleanupError) cleanupError = new Error(`PostgreSQL advisory lock ${id} was not held during release`);
+          }
+        } catch (error) {
+          if (!cleanupError) cleanupError = error;
+        }
+      }
+      client.release(cleanupError || undefined);
+      if (cleanupError) throw cleanupError;
+    };
+
+    try {
+      for (const id of ids) {
+        const result = await client.query(
+          'SELECT pg_try_advisory_lock($1, $2) AS locked',
+          [lockNamespace, id]
+        );
+        if (result.rows[0]?.locked !== true) {
+          await unlock();
+          return null;
+        }
+        acquired.push(id);
+      }
+      return { release: unlock };
+    } catch (error) {
+      await unlock().catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
    * Convert legacy question-mark placeholders to PostgreSQL parameters.
    */
   _convertPlaceholders(sql) {

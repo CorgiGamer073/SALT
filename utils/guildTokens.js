@@ -58,4 +58,23 @@ async function getGuildTokenForServer(db, platformServerId) {
   return decrypted;
 }
 
-module.exports = { getGuildToken, getGuildTokenForServer };
+async function getGuildTokenForExactServer(db, serverId, guildId) {
+  const row = await db.get(`
+    SELECT gt.token_hash
+    FROM servers s
+    JOIN guilds g ON g.id = s.guild_id
+    JOIN guild_tokens gt ON gt.guild_id = g.id
+    WHERE s.id = ?
+      AND s.guild_id = ?
+      AND s.status = 'active'
+      AND g.status = 'approved'
+      AND gt.token_type = 'nitrado'
+      AND gt.nitrado_user_id IS NOT NULL
+    ORDER BY gt.created_at DESC
+    LIMIT 1
+  `, [serverId, guildId]);
+  if (!row?.token_hash) return null;
+  return decryptToken(row.token_hash);
+}
+
+module.exports = { getGuildToken, getGuildTokenForServer, getGuildTokenForExactServer };

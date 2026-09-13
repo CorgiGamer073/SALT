@@ -21,6 +21,7 @@ const {
   captureDatabaseClock,
   markServerLogParseSuccessful,
 } = require('../utils/logSyncScheduling');
+const { acquireExactServerLogLocks } = require('../utils/logIngestionLock');
 
 async function restartServerWithMissionLock(db, serverId, dependencies) {
   return db.transaction(async tx => {
@@ -453,6 +454,20 @@ async function recordCleanupRestartOutcome(db, request, error = null) {
 }
 
 async function refreshRestartEvidence(db, serverId, dependencies = {}) {
+  if (!dependencies.ingestionLockHeld) {
+    const ingestionLock = await acquireExactServerLogLocks(db, [serverId]);
+    if (!ingestionLock) {
+      throw new Error(`Log ingestion is already active for exact server ${serverId}`);
+    }
+    try {
+      return await refreshRestartEvidence(db, serverId, {
+        ...dependencies,
+        ingestionLockHeld: true,
+      });
+    } finally {
+      await ingestionLock.release();
+    }
+  }
   const fetchStartedAt = await (dependencies.captureDatabaseClock || captureDatabaseClock)(db);
   const context = await (dependencies.resolveServerControlContext || resolveServerControlContext)(db, serverId);
   const sync = dependencies.performExactServerLogSync || logSyncService.performExactServerLogSync;
@@ -475,7 +490,8 @@ async function refreshRestartEvidence(db, serverId, dependencies = {}) {
     db,
     context.platformServerId,
     context.token,
-    serverId
+    serverId,
+    { ingestionLockHeld: true }
   );
   if (!scanResult) {
     throw new Error(`ADM evidence logs are unavailable for server ${serverId}`);

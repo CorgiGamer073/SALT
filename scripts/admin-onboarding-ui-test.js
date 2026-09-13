@@ -49,11 +49,24 @@ async function main() {
   const approval = harness('admin-guilds-approval.js');
   const shell = { guild_id: 'fixture-guild', guildName: 'Fixture', status: 'pending', created_at: '2026-01-01', serverCount: 0 };
   const html = approval.context.renderGuildCard(shell);
+  assert.ok(html.includes('Owner details unavailable'), 'installation-only guild must explain missing ownership instead of Unknown');
+  assert.ok(html.includes('/register-token'), 'missing owner needs an actionable registration step');
+  assert.ok(html.includes('does not identify the installer'), 'bot presence must not imply installer identity');
   assert.ok(html.includes('Setup incomplete'), 'installation-only guild must be labeled as incomplete setup');
   assert.ok(!html.includes('data-action="approve"'), 'installation-only guild must not offer manual approval');
   const named = approval.context.renderGuildCard({ ...shell, ownerUsername: '<script>owner</script>' });
   assert.ok(named.includes('&lt;script&gt;owner&lt;/script&gt;'));
   assert.ok(!named.includes('<script>owner</script>'));
+  const identified = approval.context.renderGuildCard({ ...shell, ownerDiscordId: '900000000000000001' });
+  assert.ok(identified.includes('900000000000000001'), 'known owner ID survives a missing username');
+
+  const listing = harness('admin-guilds.js');
+  listing.context.api.get = async () => ({ json: async () => ({ success: true, guilds: [shell] }) });
+  listing.context.loadGuilds();
+  await new Promise(resolve => setImmediate(resolve));
+  const listHtml = listing.element('guilds-container').innerHTML;
+  assert.ok(listHtml.includes('Owner details unavailable'), 'guild table must also explain an installation-only shell');
+  assert.ok(listHtml.includes('/register-token'));
 
   const users = harness('admin-users.js');
   assert.equal(users.context.isAuthorizedUser({ hasAccess: true }), true);
@@ -118,7 +131,13 @@ async function main() {
   const mutationUsers = harness('admin-users.js', {
     alert: message => mutationAlerts.push(message),
     confirm: () => true,
-    fetchWithCsrf() {
+    fetchWithCsrf(url, options) {
+      if (!options) {
+        const payload = url === '/api/roles/context'
+          ? { scopes: [], availableGrants: [] }
+          : { users: [] };
+        return Promise.resolve({ ok: true, json: async () => payload });
+      }
       const body = deferred();
       mutationBodies.push(body);
       return Promise.resolve({ ok: true, json: () => body.promise });
@@ -178,7 +197,6 @@ async function main() {
   assert.equal(actions.appended.length, 0, 'a stale guild mutation must not display a success message');
   assert.equal(vm.runInContext('pendingAction.guildId', actions.context), 'new-guild',
     'a stale guild mutation must not close the newer confirmation modal');
-
   console.log('Admin onboarding UI tests passed');
 }
 

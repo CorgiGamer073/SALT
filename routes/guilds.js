@@ -143,6 +143,7 @@ router.get('/:guildId/token-status', requireRole('owner'), async (req, res) => {
 router.get('/:guildId/servers', async (req, res) => {
   const { guildId } = req.params;
   const db = req.app.locals.db;
+  const moderatorScope = req.query.scope === 'moderate';
 
   try {
     const rows = await db.query(`
@@ -170,13 +171,14 @@ router.get('/:guildId/servers', async (req, res) => {
         AND s.status = 'active'
         AND (
           gr.role IN ('owner', 'admin')
-          OR sra.id IS NOT NULL
+          OR (sra.id IS NOT NULL AND (? = 0 OR sra.role IN ('admin', 'moderator')))
         )
       ORDER BY s.name ASC
     `, [
       req.user.id,
       req.user.id,
       guildId,
+      moderatorScope ? 1 : 0,
     ]);
 
     // Add sanitized display names while preserving original. Respect a per-server

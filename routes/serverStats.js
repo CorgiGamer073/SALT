@@ -11,26 +11,23 @@
 
 const express = require('express');
 const router = express.Router();
-const { getGuildTokenForServer } = require('../utils/guildTokens');
-const { ensureServerOwner } = require('../middleware/serverAccess');
+const { getGuildTokenForExactServer } = require('../utils/guildTokens');
+const { requireServerCapability } = require('../middleware/serverAccess');
+const { CAPABILITIES } = require('../services/authorizationService');
+const { loadServerOverview } = require('../services/serverMetricsService');
 const nitradoService = require('../services/nitradoService');
 const { sendExternalApiError } = require('../utils/externalApiResponse');
 
-router.use('/:serverId', ensureServerOwner);
+router.use('/:serverId', requireServerCapability(CAPABILITIES.SERVER_MODERATE));
 
 const MAX_CHART_POINTS = 120;
 
-async function resolveToken(db, serverId) {
-  const server = await db.get(
-    'SELECT platform_server_id FROM servers WHERE id = ?',
-    [serverId]
-  );
-  if (!server) return { error: 'Server not found', status: 404 };
-
-  const token = await getGuildTokenForServer(db, server.platform_server_id);
+async function resolveToken(db, authorization) {
+  const { id: serverId, platformServerId } = authorization.server;
+  const token = await getGuildTokenForExactServer(db, serverId, authorization.guild.id);
   if (!token) return { error: 'No Nitrado token found for this server', status: 403 };
 
-  return { token, platformServerId: server.platform_server_id };
+  return { token, platformServerId };
 }
 
 /**
@@ -44,6 +41,27 @@ function downsample(arr, maxPoints) {
 }
 
 /**
+ * GET /api/stats/:serverId/overview
+ * Return the exact-server operational snapshot. Optional provider failures are
+ * represented as warnings so database-backed health remains available.
+ */
+router.get('/:serverId/overview', async (req, res) => {
+  try {
+    const overview = await loadServerOverview({
+      db: req.app.locals.db,
+      authorization: req.authorization,
+      tokenResolver: getGuildTokenForExactServer,
+      nitrado: nitradoService,
+    });
+    if (!overview) return res.status(404).json({ error: 'Resource not found' });
+    return res.json(overview);
+  } catch (error) {
+    console.error('Failed to load server health overview:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to load server health overview' });
+  }
+});
+
+/**
  * GET /api/stats/:serverId
  * Query params: hours=6|12|24|48 (defaults to 24)
  *
@@ -51,7 +69,7 @@ function downsample(arr, maxPoints) {
  */
 router.get('/:serverId', async (req, res) => {
   const db = req.app.locals.db;
-  const { token, platformServerId, error, status } = await resolveToken(db, req.params.serverId);
+  const { token, platformServerId, error, status } = await resolveToken(db, req.authorization);
   if (error) return res.status(status).json({ success: false, error });
 
   const hours = Math.min(48, Math.max(1, parseInt(req.query.hours, 10) || 24));

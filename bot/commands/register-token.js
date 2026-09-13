@@ -11,6 +11,7 @@ const {
   getDiscordSetupPermission,
   isEligibleInitialGuildOwner,
   selectInitialGuildOwner,
+  resolveSetupUsersAndLock,
 } = require('../services/guildSetupService');
 
 module.exports = {
@@ -50,6 +51,7 @@ module.exports = {
     const avatar = interaction.user.avatar;
 
     let client;
+    let releaseError;
     try {
       const [dayzServers, nitradoUser] = await Promise.all([
         nitradoService.listGameServers(token),
@@ -68,81 +70,105 @@ module.exports = {
       const encryptedToken = encryptToken(token);
       client = await pool.connect();
       await client.query('BEGIN');
-      // Serialize first-time setup by Discord guild. Concurrent eligible users
-      // may retry, but only one transaction can create the initial owner.
+      const setupUsers = await resolveSetupUsersAndLock(client, [
+        { discordId, username, avatar }, initialOwner,
+      ]);
+      const userId = setupUsers.get(discordId).id;
+      const ownerUserId = setupUsers.get(initialOwner.discordId).id;
+      // Same guild fence as other first-time setup paths, after user fences.
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [String(guildId)]);
       const guildBeforeSetup = await client.query(
-        'SELECT id FROM guilds WHERE discord_guild_id = $1 FOR UPDATE',
+        'SELECT id, status FROM guilds WHERE discord_guild_id = $1 FOR UPDATE',
         [guildId]
       );
-
-      // Step 1: Create or update user in database
-      const userRes = await client.query(
-        'SELECT id FROM users WHERE discord_id = $1',
-        [discordId]
-      );
-      let userId;
-      if (userRes.rows.length > 0) {
-        userId = userRes.rows[0].id;
-        await client.query(
-          'UPDATE users SET username = $1, avatar = $2 WHERE id = $3',
-          [username, avatar, userId]
+      const existingGuild = guildBeforeSetup.rows[0];
+      let ownerRes = { rows: [] };
+      let actorRoleRes = { rows: [] };
+      let existingTokenRes = { rows: [] };
+      let setupStateRes = { rows: [] };
+      if (existingGuild) {
+        if (existingGuild.status === 'disabled') {
+          throw new Error('This Discord server is disabled and cannot register a Nitrado account');
+        }
+        ownerRes = await client.query(
+          `SELECT user_id FROM guild_roles
+           WHERE guild_id = $1 AND role = 'owner' FOR UPDATE`,
+          [existingGuild.id]
         );
-        console.log(`✅ User ${username} (${discordId}) updated - DB ID: ${userId}`);
-      } else {
-        const newUserRes = await client.query(
-          'INSERT INTO users (discord_id, username, avatar) VALUES ($1, $2, $3) RETURNING id',
-          [discordId, username, avatar]
+        actorRoleRes = await client.query(
+          `SELECT role FROM guild_roles
+           WHERE guild_id = $1 AND user_id = $2 FOR UPDATE`,
+          [existingGuild.id, userId]
         );
-        userId = newUserRes.rows[0].id;
-        console.log(`✅ User ${username} (${discordId}) registered - DB ID: ${userId}`);
+        if (ownerRes.rows.length > 0 &&
+            !canRegisterExistingGuildToken(actorRoleRes.rows[0]?.role, ownerRes.rows.length)) {
+          throw new Error('This guild is already registered; only its application owner or administrator can update the Nitrado token');
+        }
       }
 
-      // Step 2: Insert or update guild
-      await client.query(
+      if (existingGuild) {
+        existingTokenRes = await client.query(
+          `SELECT nitrado_user_id
+           FROM guild_tokens
+           WHERE guild_id = $1 AND token_type = 'nitrado'
+           FOR UPDATE`,
+          [existingGuild.id]
+        );
+        if (ownerRes.rows.length === 0) {
+          setupStateRes = await client.query(
+            `SELECT guild_id FROM guild_setup_state
+             WHERE guild_id = $1 AND status = 'in_progress'
+             FOR UPDATE`,
+            [existingGuild.id]
+          );
+        }
+      }
+
+      const currentPermission = await getDiscordSetupPermission(interaction);
+      if (!isEligibleInitialGuildOwner(currentPermission) ||
+          currentPermission.authoritativeOwner?.discordId !== initialOwner.discordId ||
+          String(interaction.guild?.id) !== String(guildId) ||
+          String(interaction.user?.id) !== String(discordId)) {
+        throw new Error('Discord identity or Administrator authority changed during registration');
+      }
+
+      const guildWrite = await client.query(
         `INSERT INTO guilds (discord_guild_id, name, icon_url, status)
          VALUES ($1, $2, $3, 'pending')
          ON CONFLICT(discord_guild_id) DO UPDATE SET
-           name = EXCLUDED.name,
-           icon_url = EXCLUDED.icon_url`,
+           name = EXCLUDED.name, icon_url = EXCLUDED.icon_url`,
         [guildId, guildName, guildIcon]
       );
-
+      if (guildWrite.rowCount !== 1) throw new Error('Unable to persist guild registration');
       const guildRes = await client.query(
-        'SELECT id, status FROM guilds WHERE discord_guild_id = $1',
-        [guildId]
+        'SELECT id, status FROM guilds WHERE discord_guild_id = $1', [guildId]
       );
       const guildDbId = guildRes.rows[0].id;
-      let guildStatus = guildRes.rows[0].status || 'pending';
-      await client.query('SELECT id FROM guilds WHERE id = $1 FOR UPDATE', [guildDbId]);
-
-      if (guildBeforeSetup.rows.length === 0) {
+      let guildStatus = guildRes.rows[0].status;
+      if (!['pending', 'approved'].includes(guildStatus)) {
+        throw new Error('This Discord server is disabled or unavailable for registration');
+      }
+      if (!existingGuild) {
         await client.query(
           `INSERT INTO guild_setup_state (guild_id, current_step, status, completed_steps)
            VALUES ($1, 'discord_connected', 'in_progress', '["discord_connected"]'::jsonb)
            ON CONFLICT (guild_id) DO NOTHING`,
           [guildDbId]
         );
-      }
-
-      if (guildStatus === 'disabled') {
-        throw new Error('This Discord server is disabled and cannot register a Nitrado account');
-      }
-
-      const ownerRes = await client.query(
-        `SELECT user_id FROM guild_roles
-         WHERE guild_id = $1 AND role = 'owner'
-         LIMIT 2`,
-        [guildDbId]
-      );
-      if (ownerRes.rows.length > 0) {
-        const actorRoleRes = await client.query(
-          `SELECT role FROM guild_roles
-           WHERE guild_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')`,
-          [guildDbId, userId]
+        setupStateRes = await client.query(
+          `SELECT guild_id FROM guild_setup_state
+           WHERE guild_id = $1 AND status = 'in_progress'
+           FOR UPDATE`,
+          [guildDbId]
         );
-        if (!canRegisterExistingGuildToken(actorRoleRes.rows[0]?.role, ownerRes.rows.length)) {
-          throw new Error('This guild is already registered; only its application owner or administrator can update the Nitrado token');
+        // The guild upsert and setup-state locks can wait after the early check.
+        // Recheck against the same prelocked identities before tokens or grants.
+        const latePermission = await getDiscordSetupPermission(interaction);
+        if (!isEligibleInitialGuildOwner(latePermission) ||
+            latePermission.authoritativeOwner?.discordId !== initialOwner.discordId ||
+            String(interaction.guild?.id) !== String(guildId) ||
+            String(interaction.user?.id) !== String(discordId)) {
+          throw new Error('Discord identity or Administrator authority changed during registration');
         }
       }
 
@@ -154,16 +180,24 @@ module.exports = {
         throw new Error('This Nitrado account is already registered to another Discord server');
       }
 
-      const existingTokenRes = await client.query(
-        `SELECT nitrado_user_id
-         FROM guild_tokens
-         WHERE guild_id = $1 AND token_type = 'nitrado'
-         FOR UPDATE`,
-        [guildDbId]
-      );
       const existingNitradoUserId = existingTokenRes.rows[0]?.nitrado_user_id;
       if (existingNitradoUserId && existingNitradoUserId !== nitradoUserId) {
         throw new Error('This Discord server is already bound to a different Nitrado account');
+      }
+
+      if (ownerRes.rows.length > 0) {
+        await ensureAuthoritativeInitialGuildOwner(client, {
+          guildId: guildDbId, actorUserId: userId, ownerUserId,
+          owner: currentPermission.authoritativeOwner, assignIfMissing: false,
+        });
+      }
+
+      // Bootstrap only an ownerless guild; never promote over an existing owner.
+      const ownerlessGuild = ownerRes.rows.length === 0;
+      if (ownerlessGuild) {
+        if (setupStateRes.rows.length !== 1 || existingTokenRes.rows.length > 0) {
+          throw new Error('This existing guild has no owner and requires explicit ownership reconciliation');
+        }
       }
 
       // Insert or update token
@@ -184,17 +218,16 @@ module.exports = {
       }
       console.log(`✅ Guild ${guildName} updated with token`);
 
-      // Bootstrap only an ownerless guild; never promote over an existing owner.
-      const ownerlessGuild = ownerRes.rows.length === 0;
       if (ownerlessGuild) {
-        const setupStateRes = await client.query(
-          `SELECT guild_id FROM guild_setup_state
-           WHERE guild_id = $1 AND status = 'in_progress'
-           FOR UPDATE`,
-          [guildDbId]
-        );
-        if (setupStateRes.rows.length !== 1) {
-          throw new Error('This existing guild has no owner and requires explicit ownership reconciliation');
+        // Initial token insertion can wait on a unique lock after earlier checks.
+        // Reverify the same prelocked identities before any initial role grant;
+        // denial rolls back the token along with the rest of this transaction.
+        const postTokenPermission = await getDiscordSetupPermission(interaction);
+        if (!isEligibleInitialGuildOwner(postTokenPermission) ||
+            postTokenPermission.authoritativeOwner?.discordId !== initialOwner.discordId ||
+            String(interaction.guild?.id) !== String(guildId) ||
+            String(interaction.user?.id) !== String(discordId)) {
+          throw new Error('Discord identity or Administrator authority changed during registration');
         }
       }
 
@@ -202,12 +235,40 @@ module.exports = {
         await ensureAuthoritativeInitialGuildOwner(client, {
           guildId: guildDbId,
           actorUserId: userId,
+          ownerUserId,
           owner: initialOwner,
           assignIfMissing: ownerlessGuild,
         });
       }
 
-      await client.query(
+      if (ownerlessGuild && userId !== ownerUserId) {
+        const adminGrant = await client.query(
+          `INSERT INTO guild_roles (guild_id, user_id, role, assigned_by)
+           VALUES ($1, $2, 'admin', $2)
+           ON CONFLICT (guild_id, user_id) DO UPDATE SET
+             role = EXCLUDED.role, assigned_by = EXCLUDED.assigned_by,
+             assigned_at = CURRENT_TIMESTAMP
+           WHERE guild_roles.role <> 'owner'
+           RETURNING user_id`,
+          [guildDbId, userId]
+        );
+        if (adminGrant.rowCount !== 1 || adminGrant.rows[0]?.user_id !== userId) {
+          throw new Error('Unable to assign the registering guild Administrator');
+        }
+        const grantAudit = await client.query(
+          `INSERT INTO security_audit_events
+             (actor_user_id, guild_id, action, result, target_type, target_id, metadata)
+           VALUES ($1, $2, 'guild_setup.admin_granted', 'allowed', 'user', $3,
+                   jsonb_build_object('source', 'verified_register_token',
+                     'authority', 'discord_administrator', 'scope', 'guild',
+                     'discordGuildId', $4::text, 'actorDiscordId', $5::text,
+                     'authoritativeOwnerDiscordId', $6::text))`,
+          [userId, guildDbId, String(userId), String(guildId), discordId, initialOwner.discordId]
+        );
+        if (grantAudit.rowCount !== 1) throw new Error('Unable to audit the guild Administrator grant');
+      }
+
+      const setupWrite = await client.query(
         `INSERT INTO guild_setup_state
            (guild_id, current_step, status, completed_steps, updated_by_user_id, updated_at)
          VALUES ($1, 'nitrado_connected', 'in_progress',
@@ -225,13 +286,17 @@ module.exports = {
         [guildDbId, userId]
       );
 
-      await client.query(
+      if (ownerlessGuild && setupWrite.rowCount !== 1) throw new Error('Unable to advance initial guild setup');
+
+      const registrationAudit = await client.query(
         `INSERT INTO security_audit_events
            (actor_user_id, guild_id, action, result, target_type, target_id, metadata)
          VALUES ($1, $2, 'guild_setup.register_token', 'allowed', 'guild', $3,
                  jsonb_build_object('discordGuildOwner', $4::boolean, 'discordAdministrator', $5::boolean))`,
         [userId, guildDbId, String(guildId), setupPermission.isGuildOwner, setupPermission.hasAdministrator]
       );
+
+      if (registrationAudit.rowCount !== 1) throw new Error('Unable to audit token registration');
 
       // The command already verified the initiating member's live Discord
       // Administrator authority and resolved the authoritative guild owner.
@@ -252,13 +317,14 @@ module.exports = {
           throw new Error('Guild approval state changed during setup; please retry');
         }
         guildStatus = 'approved';
-        await client.query(
+        const approvalAudit = await client.query(
           `INSERT INTO security_audit_events
              (actor_user_id, guild_id, action, result, target_type, target_id, metadata)
            VALUES ($1, $2, 'guild_setup.approved', 'allowed', 'guild', $3,
                    jsonb_build_object('source', 'verified_register_token'))`,
           [userId, guildDbId, String(guildId)]
         );
+        if (approvalAudit.rowCount !== 1) throw new Error('Unable to audit guild approval');
       }
 
       await client.query('COMMIT');
@@ -274,9 +340,12 @@ module.exports = {
                   `🖥️ Found **${dayzServers.length}** DayZ server(s)\n` +
                   `🎮 Connected to **${guildName}**\n\n` +
                   `**Servers:**\n${serverList}\n\n` +
-                  `✅ **Guild status:** Approved\n\n` +
+                  `✅ **Guild status:** Approved\n` +
+                  `🔐 **Your dashboard access:** Guild ${userId === ownerUserId ? 'Owner' : 'Admin'} — only this Discord server. No platform-wide privileges are granted.\n` +
+                  `Sign in to the dashboard with the **same Discord account** used for this command.\n` +
+                  `The Discord guild owner remains the sole Guild Owner.\n\n` +
                   `**Next steps:**\n` +
-                  (dashboardUrl ? `1. 🌐 Visit the dashboard: ${dashboardUrl}\n2. 🎚️ Use the server toggles to enable the servers you want to manage\n` : '') +
+                  (dashboardUrl ? `1. 🌐 Visit the dashboard: ${dashboardUrl}\n2. 🎚️ Guild owner: use the server toggles to enable the servers you want to manage\n` : '') +
                  `${dashboardUrl ? '3' : '1'}. 🔗 Players can link their accounts\n\n` +
                  `*Discovered servers stay disabled until the guild owner enables them on the dashboard.*`,
         allowedMentions: { parse: [] }
@@ -287,6 +356,7 @@ module.exports = {
         try {
           await client.query('ROLLBACK');
         } catch (rollbackError) {
+          releaseError = rollbackError;
           console.error('❌ Failed to roll back token registration:', rollbackError.message);
         }
       }
@@ -295,7 +365,7 @@ module.exports = {
         content: `❌ **Error:** ${error.message}\n\nPlease check your token and try again.`
       });
     } finally {
-      client?.release();
+      client?.release(releaseError);
     }
   }
 };

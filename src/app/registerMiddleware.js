@@ -21,6 +21,7 @@ const {
   reconcileConfiguredDashboardOwner,
 } = require('../../services/dashboardOwnerBootstrapService');
 const { upsertDiscordOAuthUser } = require('../../services/discordOAuthUserService');
+const { ensureAuthenticated } = require('../../middleware/auth');
 
 /**
  * Configure Passport.js serialisation/deserialisation and the Discord OAuth
@@ -187,6 +188,9 @@ function registerMiddleware(app, db, csrfProtection) {
     next();
   });
 
+  // Only report-only mission diagnostics accept larger browser drafts.
+  // Authentication precedes allocation; other APIs retain the default limit.
+  app.use('/api/validate', ensureAuthenticated, express.json({ limit: '6mb' }));
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
   // HTML documents are served only by the canonical route handlers, where

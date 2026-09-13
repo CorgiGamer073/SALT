@@ -13,6 +13,7 @@ const {
   isLogSyncRunSuccessful,
   markServerLogParseSuccessful,
 } = require('../utils/logSyncScheduling');
+const { acquireExactServerLogLocks } = require('../utils/logIngestionLock');
 
 // Get automation settings
 router.get('/settings', async (req, res) => {
@@ -143,7 +144,18 @@ router.post('/sync-now', async (req, res) => {
     settings.servers = serverIds;
     console.log(`📂 Syncing logs for servers: ${serverIds.join(', ')}`);
 
-    const token = await getDecryptedToken(db, req.user.id, serverIds);
+    const ingestionLock = await acquireExactServerLogLocks(
+      db,
+      authorizedServers.map(server => server.id)
+    );
+    if (!ingestionLock) {
+      return res.status(409).json({
+        success: false,
+        error: 'Log ingestion is already active for one or more selected servers; retry shortly',
+      });
+    }
+    try {
+      const token = await getDecryptedToken(db, req.user.id, serverIds);
     if (!token) {
       return res.status(400).json({
         success: false,
@@ -177,6 +189,7 @@ router.post('/sync-now', async (req, res) => {
           sourceObservedAt: evidence?.latestAdmModifiedAt,
           sourceObservedLogFile: evidence?.latestAdmPath,
           includeRptLogs: !rptBlockedServerIds.has(String(serverId)),
+          ingestionLockHeld: true,
         });
         if (scanResult) {
           await markServerLogParseSuccessful(
@@ -245,6 +258,11 @@ router.post('/sync-now', async (req, res) => {
       parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
       errors: result.errors.length > 0 ? result.errors : undefined
     });
+    } finally {
+      await ingestionLock.release().catch(lockErr => {
+        console.error('Failed to release exact-server log ingestion lock:', lockErr.message);
+      });
+    }
 
   } catch (err) {
     console.error('Sync error:', err);

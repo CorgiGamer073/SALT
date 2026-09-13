@@ -1,5 +1,10 @@
+const { createHash } = require('node:crypto');
 const xml2js = require('xml2js');
-const { XMLValidator } = require('fast-xml-parser'); // npm install fast-xml-parser
+const { XMLValidator } = require('fast-xml-parser');
+
+const MAX_INPUT_BYTES = 5 * 1024 * 1024;
+const MAX_DIAGNOSTICS = 100;
+const MAX_DIAGNOSTIC_CHARS = 512;
 
 class ValidationService {
   constructor() {
@@ -10,81 +15,80 @@ class ValidationService {
    * Load validation rules for each file type
    */
   loadValidationRules() {
+    // Deliberately partial, file-specific checks, not an engine schema/class registry.
+    // Empty CE registries are valid; validate entries when present.
     return {
       'types.xml': {
-        rootElement: 'types',
-        requiredChildElements: ['type'],
-        typeAttributes: {
-          required: ['name'],
-          optional: ['nominal', 'lifetime', 'restock', 'min', 'quantmin', 'quantmax', 'cost', 'count_in_cargo', 'count_in_hoarder', 'count_in_map', 'count_in_player', 'crafted', 'deloot']
-        },
-        childElements: {
-          optional: ['flags', 'category', 'usage', 'value', 'tag']
-        }
+        rootElement: 'types', checkedChildElements: ['type'],
+        typeAttributes: { required: ['name'] }
       },
       'events.xml': {
-        rootElement: 'eventposdef',
-        requiredChildElements: ['event'],
-        eventAttributes: {
-          required: ['name']
-        },
-        childElements: {
-          required: ['pos'],
-          optional: ['active']
-        }
+        rootElement: 'events', checkedChildElements: ['event'],
+        eventAttributes: { required: ['name'] }
       },
-      'cfgweather.xml': {
-        rootElement: 'weather',
-        requiredChildElements: ['object'],
-        objectAttributes: {
-          required: ['class', 'name']
-        }
+      'cfgeventspawns.xml': {
+        rootElement: 'eventposdef', checkedChildElements: ['event'],
+        eventAttributes: { required: ['name'] }
       },
-      'cfgenvironment.xml': {
-        rootElement: 'variables',
-        requiredChildElements: ['var']
-      },
-      'cfgplayerspawnpoints.xml': {
-        rootElement: 'spawnpoints',
-        requiredChildElements: ['fresh', 'hop']
-      },
+      'cfgweather.xml': { rootElement: 'weather' },
+      'cfgenvironment.xml': { rootElement: 'env' },
+      'cfgplayerspawnpoints.xml': { rootElement: 'playerspawnpoints' },
       'cfgrandompresets.xml': {
-        rootElement: 'randompresets',
-        requiredChildElements: ['cargo']
+        rootElement: 'randompresets', checkedChildElements: ['cargo', 'attachments'],
+        cargoAttributes: { required: ['name'] },
+        attachmentsAttributes: { required: ['name'] },
+        itemAttributes: { required: ['name'] },
+        nestedChildren: { cargo: ['item'], attachments: ['item'] }
       },
       'globals.xml': {
-        rootElement: 'variables',
-        requiredChildElements: ['var'],
-        varAttributes: {
-          required: ['name', 'type', 'value']
-        }
+        rootElement: 'variables', checkedChildElements: ['var'],
+        varAttributes: { required: ['name', 'type', 'value'] }
       },
-      'spawnabletypes.xml': {
-        rootElement: 'spawnabletypes',
-        requiredChildElements: ['type']
+      'cfgspawnabletypes.xml': {
+        rootElement: 'spawnabletypes', checkedChildElements: ['type'],
+        typeAttributes: { required: ['name'] }
       },
       'mapgroupproto.xml': {
-        rootElement: 'group',
-        requiredChildElements: ['child']
+        rootElement: 'prototype', checkedChildElements: ['group'],
+        groupAttributes: { required: ['name'] },
+        containerAttributes: { required: ['name'] },
+        nestedChildren: { group: ['container'] }
       },
       'mapgrouppos.xml': {
-        rootElement: 'map',
-        requiredChildElements: ['group']
+        rootElement: 'map', checkedChildElements: ['group'],
+        groupAttributes: { required: ['name'] }
       },
-      'messages.xml': {
-        rootElement: 'messages',
-        requiredChildElements: ['message']
-      }
+      'messages.xml': { rootElement: 'messages', checkedChildElements: ['message'] }
     };
   }
 
   /**
-   * Validate XML file
+   * Inspect a submitted XML string without rewriting it or verifying engine readiness.
+   * documentType is an optional trusted canonical filename, e.g. 'types.xml'. A
+   * recognized explicit type takes precedence; otherwise use the exact basename.
+   * 'basic' coverage means the root and the targeted checks in loadValidationRules,
+   * NOT a full schema, class allowlist, cross-file reference audit or runtime test.
+   * Unknown names/types are 'syntax-only'. JSON uses that same support level.
+   *
+   * Reports retain valid/errors/warnings/info and add documentType (or null),
+   * supportLevel, sha256 (exact UTF-8 input; null for non-string input), inputBytes,
+   * limits and truncation[kind] = { total, omitted, truncated }. Summary counts
+   * remain counts of returned diagnostics; use truncation totals for full counts.
+   * Parsed XML/JSON trees are intentionally not returned to API consumers.
    */
-  async validateXML(fileName, content) {
-    const errors = [];
-    const warnings = [];
-    const info = [];
+  async validateXML(fileName, content, documentType) {
+    // Names are case-sensitive identifiers. Do not infer a schema from XML content.
+    const basename = typeof fileName === 'string' ? fileName.split(/[\\/]/).pop() : '';
+    const recognized = name => typeof name === 'string' && Object.hasOwn(this.rules, name);
+    const resolvedType = recognized(documentType) ? documentType : (recognized(basename) ? basename : null);
+    const metadata = this.inputMetadata(content, resolvedType);
+    const { errors, warnings, info } = this.createDiagnostics();
+
+    const inputError = this.checkInput(content, metadata);
+    if (inputError) {
+      errors.push(inputError);
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
+    }
 
     // Step 1: Check if content is empty
     if (!content || content.trim().length === 0) {
@@ -95,12 +99,12 @@ class ValidationService {
         severity: 'error',
         code: 'EMPTY_FILE'
       });
-      return { valid: false, errors, warnings, info };
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
     }
 
     // Step 2: Basic XML syntax validation
     const syntaxValidation = XMLValidator.validate(content, {
-      allowBooleanAttributes: true
+      allowBooleanAttributes: false
     });
 
     if (syntaxValidation !== true) {
@@ -111,19 +115,32 @@ class ValidationService {
         severity: 'error',
         code: 'XML_SYNTAX_ERROR'
       });
-      return { valid: false, errors, warnings, info };
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
     }
 
-    info.push({
-      message: '✓ XML syntax is valid',
-      code: 'SYNTAX_OK'
-    });
-
-    // Step 3: Parse XML
+    // Step 3: Parse the entire XML document, not just its first root.
     let parsedXML;
     try {
-      const parser = new xml2js.Parser();
-      parsedXML = await parser.parseStringPromise(content);
+      const parser = new xml2js.Parser({ strict: true, explicitArray: true });
+      // parseStringPromise resolves at the first root and can ignore trailing errors.
+      // Use its existing SAX stream through close(), retaining xml2js's tree builder.
+      const stream = parser.saxParser;
+      const open = stream.onopentag;
+      const close = stream.onclosetag;
+      let depth = 0;
+      let roots = 0;
+      stream.onopentag = node => {
+        if (depth === 0 && ++roots > 1) throw new Error('XML must have exactly one root element');
+        depth++;
+        open(node);
+      };
+      stream.onclosetag = name => {
+        close(name);
+        depth--;
+      };
+      parser.on('error', error => { throw error; });
+      stream.write(content).close();
+      parsedXML = parser.resultObject;
     } catch (error) {
       errors.push({
         line: 0,
@@ -132,8 +149,10 @@ class ValidationService {
         severity: 'error',
         code: 'PARSE_ERROR'
       });
-      return { valid: false, errors, warnings, info };
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
     }
+
+    info.push({ message: '✓ XML syntax is valid', code: 'SYNTAX_OK' });
 
     // Step 4: Check XML declaration
     if (!content.trim().startsWith('<?xml')) {
@@ -147,13 +166,10 @@ class ValidationService {
     }
 
     // Step 5: File-specific validation
-    const rules = this.rules[fileName];
+    const rules = resolvedType ? this.rules[resolvedType] : null;
 
     if (rules) {
-      const structureValidation = this.validateStructure(parsedXML, rules);
-      errors.push(...structureValidation.errors);
-      warnings.push(...structureValidation.warnings);
-      info.push(...structureValidation.info);
+      this.validateStructure(parsedXML, rules, { errors, warnings, info });
     } else {
       info.push({
         message: 'No specific validation rules for this file type',
@@ -166,22 +182,14 @@ class ValidationService {
     warnings.push(...commonIssues.warnings);
     info.push(...commonIssues.info);
 
-    return {
-      valid: errors.length === 0,
-      errors,
-      warnings,
-      info,
-      structure: parsedXML
-    };
+    return this.finishReport({ valid: errors.length === 0, errors, warnings, info, ...metadata });
   }
 
   /**
    * Validate XML structure against rules
    */
-  validateStructure(parsedXML, rules) {
-    const errors = [];
-    const warnings = [];
-    const info = [];
+  validateStructure(parsedXML, rules, diagnostics = this.createDiagnostics()) {
+    const { errors, warnings, info } = diagnostics;
 
     // Check root element
     const rootKeys = Object.keys(parsedXML);
@@ -209,28 +217,12 @@ class ValidationService {
       code: 'ROOT_OK'
     });
 
-    // Check required child elements
-    if (rules.requiredChildElements) {
-      const rootData = parsedXML[rootElement];
-
-      rules.requiredChildElements.forEach(childName => {
-        if (!rootData[childName]) {
-          errors.push({
-            message: `Missing required child element: <${childName}>`,
-            severity: 'error',
-            code: 'MISSING_CHILD'
-          });
-        } else {
-          const childArray = Array.isArray(rootData[childName]) ? rootData[childName] : [rootData[childName]];
-          info.push({
-            message: `✓ Found ${childArray.length} <${childName}> element(s)`,
-            code: 'CHILD_COUNT'
-          });
-
-          // Validate children
-          this.validateChildren(childName, childArray, rules, errors, warnings);
-        }
-      });
+    const rootData = parsedXML[rootElement];
+    for (const childName of rules.checkedChildElements || []) {
+      if (!Object.hasOwn(rootData, childName)) continue;
+      const children = rootData[childName];
+      info.push({ message: `✓ Found ${children.length} <${childName}> element(s)`, code: 'CHILD_COUNT' });
+      this.validateChildren(childName, children, rules, errors, warnings);
     }
 
     return { errors, warnings, info };
@@ -247,21 +239,12 @@ class ValidationService {
     if (!attributeRules) return;
 
     children.forEach((child, index) => {
-      if (!child.$) {
-        warnings.push({
-          message: `<${childName}> at index ${index} has no attributes`,
-          severity: 'warning',
-          code: 'NO_ATTRIBUTES'
-        });
-        return;
-      }
-
-      const attrs = child.$;
+      const attrs = child.$ || {};
 
       // Check required attributes
       if (attributeRules.required) {
         attributeRules.required.forEach(attrName => {
-          if (!attrs[attrName]) {
+          if (typeof attrs[attrName] !== 'string' || !attrs[attrName].trim()) {
             errors.push({
               message: `<${childName}> at index ${index} missing required attribute: ${attrName}`,
               severity: 'error',
@@ -273,84 +256,55 @@ class ValidationService {
         });
       }
 
-      // Check for invalid attributes
-      const validAttrs = [
-        ...(attributeRules.required || []),
-        ...(attributeRules.optional || [])
-      ];
-
-      Object.keys(attrs).forEach(attrName => {
-        if (!validAttrs.includes(attrName)) {
-          warnings.push({
-            message: `<${childName}> at index ${index} has unknown attribute: ${attrName}`,
-            severity: 'warning',
-            code: 'UNKNOWN_ATTRIBUTE',
-            element: childName,
-            attribute: attrName
-          });
+      // Only declared paths are checked; unknown attributes/classes are not inferred.
+      for (const nestedName of rules.nestedChildren?.[childName] || []) {
+        if (Object.hasOwn(child, nestedName)) {
+          this.validateChildren(nestedName, child[nestedName], rules, errors, warnings);
         }
-      });
+      }
 
-      // Special validations
-      if (childName === 'type' && attrs.name) {
-        // Validate type name format
-        if (!/^[a-zA-Z0-9_]+$/.test(attrs.name)) {
-          warnings.push({
-            message: `<type> name "${attrs.name}" contains invalid characters (use only letters, numbers, underscores)`,
-            severity: 'warning',
-            code: 'INVALID_NAME_FORMAT'
-          });
-        }
-
-        // Validate numeric attributes
-        ['nominal', 'lifetime', 'restock', 'min', 'quantmin', 'quantmax', 'cost'].forEach(numAttr => {
-          if (attrs[numAttr]) {
-            const value = parseFloat(attrs[numAttr]);
-            if (isNaN(value)) {
+      // CE types.xml numeric settings are text CHILD elements, not attributes.
+      // Do not infer class existence or apply these fields to spawnable types.
+      if (rules.rootElement === 'types' && childName === 'type') {
+        const values = {};
+        for (const field of ['nominal', 'lifetime', 'restock', 'min', 'quantmin', 'quantmax', 'cost']) {
+          if (!Object.hasOwn(child, field)) continue;
+          for (const raw of child[field]) {
+            const value = this.parseFiniteNumber(raw);
+            if (value === null) {
               errors.push({
-                message: `<type> "${attrs.name}" has invalid ${numAttr}: "${attrs[numAttr]}" (must be numeric)`,
-                severity: 'error',
-                code: 'INVALID_NUMBER'
+                message: `<type> at index ${index} has invalid <${field}> (must be a complete finite number)`,
+                severity: 'error', code: 'INVALID_NUMBER', element: 'type', field
               });
-            } else if (value < 0) {
+              continue;
+            }
+            values[field] = value;
+            const quantitySentinel = (field === 'quantmin' || field === 'quantmax') && value === -1;
+            if (value < 0 && !quantitySentinel) {
               warnings.push({
-                message: `<type> "${attrs.name}" has negative ${numAttr}: ${value}`,
-                severity: 'warning',
-                code: 'NEGATIVE_VALUE'
+                message: `<type> at index ${index} has negative <${field}>: ${value}`,
+                severity: 'warning', code: 'NEGATIVE_VALUE'
               });
             }
           }
-        });
-
-        // Validate min/nominal relationship
-        if (attrs.min && attrs.nominal) {
-          const min = parseInt(attrs.min);
-          const nominal = parseInt(attrs.nominal);
-          if (min > nominal) {
-            warnings.push({
-              message: `<type> "${attrs.name}": min (${min}) is greater than nominal (${nominal})`,
-              severity: 'warning',
-              code: 'MIN_GREATER_THAN_NOMINAL'
-            });
-          }
         }
-
-        // Validate quantmin/quantmax relationship
-        if (attrs.quantmin && attrs.quantmax) {
-          const quantmin = parseInt(attrs.quantmin);
-          const quantmax = parseInt(attrs.quantmax);
-          if (quantmin > quantmax) {
-            warnings.push({
-              message: `<type> "${attrs.name}": quantmin (${quantmin}) is greater than quantmax (${quantmax})`,
-              severity: 'warning',
-              code: 'QUANTMIN_GREATER_THAN_QUANTMAX'
-            });
-          }
+        // Vanilla dormant/non-CE entries can retain min > 0 with nominal = 0.
+        if (values.nominal > 0 && values.min > values.nominal) {
+          warnings.push({
+            message: `<type> at index ${index}: min (${values.min}) is greater than nominal (${values.nominal})`,
+            severity: 'warning', code: 'MIN_GREATER_THAN_NOMINAL'
+          });
+        }
+        if (values.quantmin !== -1 && values.quantmax !== -1 && values.quantmin > values.quantmax) {
+          warnings.push({
+            message: `<type> at index ${index}: quantmin (${values.quantmin}) is greater than quantmax (${values.quantmax})`,
+            severity: 'warning', code: 'QUANTMIN_GREATER_THAN_QUANTMAX'
+          });
         }
       }
 
       // Validate event positions
-      if (childName === 'event' && child.pos) {
+      if (rules.rootElement === 'eventposdef' && childName === 'event' && child.pos) {
         const positions = Array.isArray(child.pos) ? child.pos : [child.pos];
         positions.forEach((pos, posIndex) => {
           if (!pos.$ || !pos.$.x || !pos.$.z) {
@@ -360,10 +314,10 @@ class ValidationService {
               code: 'MISSING_COORDINATES'
             });
           } else {
-            const x = parseFloat(pos.$.x);
-            const z = parseFloat(pos.$.z);
+            const x = this.parseFiniteNumber(pos.$.x);
+            const z = this.parseFiniteNumber(pos.$.z);
 
-            if (isNaN(x) || isNaN(z)) {
+            if (x === null || z === null) {
               errors.push({
                 message: `<event> "${attrs.name}" position ${posIndex} has invalid coordinates`,
                 severity: 'error',
@@ -371,15 +325,7 @@ class ValidationService {
               });
             }
 
-            // Check if coordinates are within typical map bounds
-            const maxCoord = 15360; // Largest DayZ map
-            if (x < 0 || x > maxCoord || z < 0 || z > maxCoord) {
-              warnings.push({
-                message: `<event> "${attrs.name}" position ${posIndex} coordinates may be out of bounds (${x}, ${z})`,
-                severity: 'warning',
-                code: 'COORDINATES_OUT_OF_BOUNDS'
-              });
-            }
+            // No map is provided: do not invent universal coordinate bounds.
           }
         });
       }
@@ -409,6 +355,75 @@ class ValidationService {
         }
       }
     });
+  }
+
+  createDiagnostics() {
+    const diagnostics = {};
+    for (const kind of ['errors', 'warnings', 'info']) {
+      const items = [];
+      let total = 0;
+      Object.defineProperties(items, {
+        total: { get: () => total },
+        push: { value: (...entries) => {
+          total += entries.length;
+          for (const entry of entries) {
+            if (items.length >= MAX_DIAGNOSTICS) break;
+            const bounded = {};
+            for (const [key, value] of Object.entries(entry)) {
+              bounded[key] = typeof value === 'string' && value.length > MAX_DIAGNOSTIC_CHARS
+                ? value.slice(0, MAX_DIAGNOSTIC_CHARS - 1) + '…' : value;
+            }
+            Array.prototype.push.call(items, bounded);
+          }
+          return items.length;
+        } }
+      });
+      diagnostics[kind] = items;
+    }
+    return diagnostics;
+  }
+
+  finishReport(result) {
+    const truncation = {};
+    for (const kind of ['errors', 'warnings', 'info']) {
+      const items = result[kind];
+      const total = items.total ?? items.length;
+      const omitted = total - items.length;
+      truncation[kind] = { total, omitted, truncated: omitted > 0 };
+      result[kind] = Array.from(items);
+    }
+    return { ...result, truncation };
+  }
+
+  inputMetadata(content, documentType) {
+    const isText = typeof content === 'string';
+    return {
+      documentType,
+      supportLevel: documentType ? 'basic' : 'syntax-only',
+      // Exact UTF-8 input, before BOM/whitespace/newline parsing or normalization.
+      sha256: isText ? createHash('sha256').update(content, 'utf8').digest('hex') : null,
+      inputBytes: isText ? Buffer.byteLength(content, 'utf8') : null,
+      limits: { maxInputBytes: MAX_INPUT_BYTES, maxDiagnostics: MAX_DIAGNOSTICS, maxDiagnosticChars: MAX_DIAGNOSTIC_CHARS }
+    };
+  }
+
+  checkInput(content, metadata) {
+    if (typeof content !== 'string') {
+      return { line: 0, column: 0, severity: 'error', code: 'INVALID_CONTENT', message: 'Content must be a UTF-8 string' };
+    }
+    if (metadata.inputBytes > MAX_INPUT_BYTES) {
+      return { line: 0, column: 0, severity: 'error', code: 'INPUT_TOO_LARGE', message: 'Content exceeds the 5 MiB input limit' };
+    }
+    return null;
+  }
+
+  parseFiniteNumber(raw) {
+    // No partial parse, booleans, hex, empty values, nested elements or Infinity.
+    if (typeof raw !== 'string') return null;
+    const text = raw.trim();
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return null;
+    const value = Number(text);
+    return Number.isFinite(value) ? value : null;
   }
 
   /**
@@ -487,9 +502,14 @@ class ValidationService {
    * Validate JSON file
    */
   validateJSON(fileName, content) {
-    const errors = [];
-    const warnings = [];
-    const info = [];
+    const metadata = this.inputMetadata(content, null);
+    const { errors, warnings, info } = this.createDiagnostics();
+
+    const inputError = this.checkInput(content, metadata);
+    if (inputError) {
+      errors.push(inputError);
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
+    }
 
     // Check if empty
     if (!content || content.trim().length === 0) {
@@ -500,13 +520,12 @@ class ValidationService {
         severity: 'error',
         code: 'EMPTY_FILE'
       });
-      return { valid: false, errors, warnings, info };
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
     }
 
     // Try to parse JSON
-    let parsed;
     try {
-      parsed = JSON.parse(content);
+      JSON.parse(content);
       info.push({
         message: '✓ Valid JSON syntax',
         code: 'JSON_VALID'
@@ -527,7 +546,7 @@ class ValidationService {
         severity: 'error',
         code: 'JSON_SYNTAX_ERROR'
       });
-      return { valid: false, errors, warnings, info };
+      return this.finishReport({ valid: false, errors, warnings, info, ...metadata });
     }
 
     // Check for common JSON issues
@@ -561,20 +580,14 @@ class ValidationService {
     // Detect indentation style
     const spaceIndents = indentations.filter(i => i.includes(' ') && !i.includes('\t'));
     if (spaceIndents.length > 0) {
-      const commonIndent = Math.min(...spaceIndents.map(i => i.length).filter(l => l > 0));
+      const commonIndent = spaceIndents.reduce((min, indent) => Math.min(min, indent.length), Infinity);
       info.push({
         message: `✓ Using ${commonIndent}-space indentation`,
         code: 'INDENTATION_STYLE'
       });
     }
 
-    return {
-      valid: errors.length === 0,
-      errors,
-      warnings,
-      info,
-      parsed
-    };
+    return this.finishReport({ valid: errors.length === 0, errors, warnings, info, ...metadata });
   }
 
   /**

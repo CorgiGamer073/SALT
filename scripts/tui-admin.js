@@ -3,6 +3,58 @@ const blessed = require('blessed');
 const contrib = require('blessed-contrib');
 const { initializeDatabase } = require('../db/abstraction');
 const { performLogSyncConcurrent } = require('../services/logSyncService');
+const { decryptToken } = require('../utils/encryption');
+const { acquireExactServerLogLocks } = require('../utils/logIngestionLock');
+
+async function syncExactServer(db, serverId, {
+  sync = performLogSyncConcurrent,
+  decrypt = decryptToken,
+  acquireLocks = acquireExactServerLogLocks,
+} = {}) {
+  if (!Number.isSafeInteger(serverId) || serverId <= 0) {
+    throw new Error('Select an exact server before starting log sync');
+  }
+  const rows = await db.query(
+    `SELECT s.id AS server_id,
+            CAST(s.platform_server_id AS TEXT) AS platform_server_id,
+            g.discord_guild_id,
+            gt.token_hash
+       FROM servers s
+       JOIN guilds g ON g.id = s.guild_id
+       JOIN guild_tokens gt ON gt.guild_id = g.id
+         AND gt.token_type = ?
+         AND gt.nitrado_user_id IS NOT NULL
+      WHERE s.id = ?
+        AND s.status = ?
+        AND g.status = ?
+        AND g.disabled_at IS NULL`,
+    ['nitrado', serverId, 'active', 'approved']
+  );
+  if (rows.length !== 1) {
+    throw new Error(`Exact server ${serverId} has no unique current provider credential`);
+  }
+  const ingestionLock = await acquireLocks(db, [serverId]);
+  if (!ingestionLock) {
+    throw new Error(`Log ingestion is already active for exact server ${serverId}`);
+  }
+  try {
+    const row = rows[0];
+    const authorizedServers = new Map([[row.platform_server_id, {
+      id: row.server_id,
+      platformServerId: row.platform_server_id,
+      guildDiscordId: row.discord_guild_id,
+    }]]);
+    return await sync(
+      db,
+      null,
+      decrypt(row.token_hash),
+      [row.platform_server_id],
+      authorizedServers
+    );
+  } finally {
+    await ingestionLock.release();
+  }
+}
 
 // Helper: fetch servers; accepts optional db to avoid redundant connects
 async function fetchServers(db) {
@@ -81,19 +133,12 @@ async function run() {
     footer.setContent('Starting log sync...');
     screen.render();
     try {
-      const servers = await fetchServers(db);
-      const ids = servers.map(s => String(s.platform_server_id));
-      const row = await db.get(
-        `SELECT token_hash
-         FROM guild_tokens
-         WHERE token_type = ?
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        ['nitrado']
-      );
-      const enc = require('../utils/encryption');
-      const token = row && row.token_hash ? enc.decryptToken(row.token_hash) : null;
-      const out = await performLogSyncConcurrent(db, 1, token, ids);
+      const idx = serverList.selected;
+      if (idx == null || !serverList.rows.items[idx]) {
+        throw new Error('Select an exact server before starting log sync');
+      }
+      const id = parseInt(serverList.rows.items[idx].content.split(/\s+/)[0], 10);
+      const out = await syncExactServer(db, id);
       footer.setContent('Log sync finished: ' + JSON.stringify(out));
     } catch (e) { footer.setContent('Log sync error: ' + e.message); }
     screen.render();
@@ -139,4 +184,13 @@ async function run() {
   screen.render();
 }
 
-run().catch(e => { console.error(e); process.exit(1); });
+if (require.main === module) {
+  run().catch(e => { console.error(e); process.exit(1); });
+}
+
+module.exports = {
+  fetchOnlinePlayers,
+  fetchServers,
+  run,
+  syncExactServer,
+};

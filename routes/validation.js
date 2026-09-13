@@ -1,11 +1,29 @@
 const express = require('express');
 const router = express.Router();
 const validationService = require('../services/validationService');
+const { ensureAuthenticated } = require('../middleware/auth');
+const MAX_CONTENT_BYTES = 5 * 1024 * 1024;
+
+function checkDraft(req, res) {
+  const { fileName, content, documentType } = req.body || {};
+  if (typeof fileName !== 'string' || !fileName || fileName.length > 512 ||
+      typeof content !== 'string' ||
+      (documentType !== undefined && (typeof documentType !== 'string' || documentType.length > 64))) {
+    res.status(400).json({ success: false, error: 'A file name and string content are required' });
+    return false;
+  }
+  if (Buffer.byteLength(content, 'utf8') > MAX_CONTENT_BYTES) {
+    res.status(413).json({ success: false, error: 'Draft exceeds the 5 MiB inspection limit' });
+    return false;
+  }
+  return true;
+}
 
 // Validate file content
-router.post('/validate/:fileType', async (req, res) => {
+router.post('/validate/:fileType', ensureAuthenticated, async (req, res) => {
+  if (!checkDraft(req, res)) return;
   const { fileType } = req.params;
-  const { fileName, content } = req.body;
+  const { fileName, content, documentType } = req.body;
 
   if (!content) {
     return res.status(400).json({ success: false, error: 'Content required' });
@@ -15,7 +33,7 @@ router.post('/validate/:fileType', async (req, res) => {
     let result;
 
     if (fileType === 'xml') {
-      result = await validationService.validateXML(fileName, content);
+      result = await validationService.validateXML(fileName, content, documentType);
     } else if (fileType === 'json') {
       result = validationService.validateJSON(fileName, content);
     } else {
@@ -26,6 +44,9 @@ router.post('/validate/:fileType', async (req, res) => {
 
     res.json({
       success: true,
+      source: 'submitted_draft',
+      reportOnly: true,
+      providerVerified: false,
       validation: result,
       summary
     });

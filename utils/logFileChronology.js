@@ -49,6 +49,13 @@ function parseStrictTimestampMs(value) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+function isSupportedAdmFilename(fileName) {
+  return typeof fileName === 'string'
+    && path.basename(fileName) === fileName
+    && /^DayZServer(?:P?_X1|_PS4|_NSW2)?_x64_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.ADM$/i.test(fileName)
+    && logStartTimeMs(fileName) !== null;
+}
+
 function isSupportedRptFilename(fileName) {
   return typeof fileName === 'string'
     && path.basename(fileName) === fileName
@@ -66,6 +73,7 @@ function compareLogFileEntries(left, right) {
 module.exports = {
   logStartTimeMs,
   parseStrictTimestampMs,
+  isSupportedAdmFilename,
   isSupportedRptFilename,
   compareLogFileEntries,
 };

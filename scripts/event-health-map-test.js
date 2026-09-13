@@ -303,8 +303,8 @@ function testExactServerRouteContract() {
   const source = fs.readFileSync(routePath, 'utf8');
   const serviceSource = fs.readFileSync(servicePath, 'utf8');
   const registration = fs.readFileSync(path.join(__dirname, '..', 'src', 'app', 'registerRoutes.js'), 'utf8');
-  assert.match(source, /ensurePlatformServerOwner/,
-    'event health must require exact authorized provider-server access');
+  assert.match(source, /requirePlatformServerCapability\(CAPABILITIES\.SERVER_MODERATE\)/,
+    'event health must require exact authorized moderator-or-higher provider-server access');
   assert.match(source, /req\.platformServerAccess\.discordGuildId/,
     'event health must derive the local guild directory from canonical authorization context');
   assert.match(source, /req\.platformServerAccess\.platformServerId/,
@@ -397,10 +397,10 @@ function testMapsPreserveCoordinateStableTilesAndExposeEvidenceBackedData() {
     'map discovery must send the exact selected guild');
   assert.match(adminClient, /event-spawns\/' \+ serverId \+ '\/' \+ mapName \+[\s\S]{0,120}encodeURIComponent\(serverContext\.guildId\)/,
     'event spawn loading must send the exact selected guild');
-  assert.match(registration, /server-maps\/:serverId'[^\n]*ensurePlatformServerOwner/,
-    'map discovery must use canonical exact-server authorization');
-  assert.match(registration, /event-spawns\/:serverId\/:mapName'[^\n]*ensurePlatformServerOwner/,
-    'event spawn loading must use canonical exact-server authorization');
+  assert.match(registration, /server-maps\/:serverId'[^\n]*ensurePlatformServerModerator/,
+    'map discovery must use canonical exact-server moderator authorization');
+  assert.match(registration, /event-spawns\/:serverId\/:mapName'[^\n]*ensurePlatformServerModerator/,
+    'event spawn loading must use canonical exact-server moderator authorization');
   const eventSpawnRoute = registration.slice(
     registration.indexOf("app.get('/api/event-spawns/:serverId/:mapName'"),
     registration.indexOf("app.get('/api/detect-structure/:serverId'")

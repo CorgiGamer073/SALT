@@ -377,9 +377,9 @@ async function testLinkConflictAndOwnerViewsDoNotLeakGlobalOwnership() {
   const candidateService = fs.readFileSync(path.join(root, 'services/altAccountCandidateService.js'), 'utf8');
   assert.match(candidateService, /spm\.server_id = \?/,
     'linked ownership evidence must be bound to the exact server');
-  assert.match(candidateService, /ending\.server_id = \?/,
+  assert.match(candidateService, /starting\.server_id = \?/,
     'behavioral session evidence must be bound to the exact server');
-  assert.match(candidateService, /candidate\.server_id = ending\.server_id/,
+  assert.match(candidateService, /ending\.server_id = starting\.server_id/,
     'rapid-switch range lookup must remain on the same exact server');
   assert.match(candidateService, /aar\.server_id = \?/,
     'review decisions must be bound to the exact server');

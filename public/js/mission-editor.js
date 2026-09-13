@@ -1,3 +1,4 @@
+/* global window, document, navigator, alert, confirm, MissionDoctor, fetchWithCsrf */
 const urlParams = new URLSearchParams(window.location.search);
 const serverId = urlParams.get('server');
 
@@ -5,7 +6,7 @@ const serverId = urlParams.get('server');
 function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 console.log('Server ID from URL:', serverId);
@@ -22,6 +23,11 @@ let originalHash = null;
 let conflictServerHash = null;
 let fileList = {};
 let hasUnsavedChanges = false;
+let fileLoaded = false;
+let fileOperationPending = false;
+let editorContextVersion = 0;
+let currentDocumentType;
+let currentSource;
 
 const editor = document.getElementById('editor');
 const saveBtn = document.getElementById('saveBtn');
@@ -37,6 +43,27 @@ const fileInfo = document.getElementById('fileInfo');
 const fileInfoText = document.getElementById('fileInfoText');
 const refreshIndicator = document.getElementById('refreshIndicator');
 
+const doctor = MissionDoctor.create({
+    button: document.getElementById('doctorBtn'),
+    report: document.getElementById('doctorReport'),
+    source: document.getElementById('doctorSource'),
+    request: (...args) => fetchWithCsrf(...args),
+    getDraft: () => fileLoaded && !fileOperationPending ? {
+        fileName: currentFile, content: editor.value, documentType: currentDocumentType,
+        contextVersion: editorContextVersion, loadedHash: originalHash, source: currentSource,
+    } : null,
+});
+
+function updateEditorControls() {
+    editor.disabled = !fileLoaded || fileOperationPending;
+    releaseLockBtn.disabled = fileOperationPending;
+    for (const button of [saveBtn, formatBtn, reloadBtn, backupBtn, diffBtn]) {
+        button.disabled = !fileLoaded || fileOperationPending;
+    }
+    saveBtn.disabled = saveBtn.disabled || !currentLockId;
+    doctor.invalidate();
+}
+
 // Load file list
 async function loadFileList() {
     try {
@@ -45,11 +72,14 @@ async function loadFileList() {
 
         if (data.success) {
             fileList = data.files;
+            const diagnostics = (data.diagnostics || []).map(item => item.message).filter(Boolean).join(' ');
+            document.getElementById('fileListStatus').textContent =
+                `${data.truncated ? 'Incomplete discovery. ' : ''}Synchronized working copies; provider freshness unknown. ${diagnostics}`;
             renderFileTree();
         } else {
             document.getElementById('fileTree').innerHTML = `
                 <div style="padding: 20px; text-align: center; color: #dc3545;">
-                    <p>❌ ${data.error}</p>
+                    <p>❌ ${escapeHtml(data.error || 'Unknown error')}</p>
                 </div>
             `;
         }
@@ -65,9 +95,13 @@ async function loadFileList() {
     }
 }
 
+function encodedFilePath(fileName) {
+    return fileName.split('/').map(encodeURIComponent).join('/');
+}
+
 // Render file tree with directories
 function renderFileTree() {
-    const tree = {};
+    const tree = Object.create(null);
 
     // Organize files by directory
     Object.keys(fileList).forEach(filePath => {
@@ -120,7 +154,7 @@ function renderFileTree() {
                 <li class="file-tree-folder">
                     <div class="folder-header" data-folder-toggle>
                         <span class="folder-icon">▶</span>
-                        📁 ${dir}
+                        📁 ${escapeHtml(dir)}
                         <span class="badge badge-xml">${files.length}</span>
                     </div>
                     <ul class="folder-files">
@@ -135,7 +169,7 @@ function renderFileTree() {
     document.getElementById('fileTree').innerHTML = html;
 }
 
-function renderFileItem(path, file) {
+function renderFileItem(path) {
     const fileName = path.split('/').pop();
     const ext = fileName.split('.').pop().toLowerCase();
     let icon = '📄';
@@ -150,10 +184,10 @@ function renderFileItem(path, file) {
     }
 
     return `
-        <li class="file-item" data-file-path="${path}">
+        <li class="file-item" data-file-path="${escapeHtml(path)}">
             <span>
                 <span class="file-icon">${icon}</span>
-                ${fileName}
+                ${escapeHtml(fileName)}
             </span>
             <span class="badge ${badgeClass}">${ext.toUpperCase()}</span>
         </li>
@@ -168,15 +202,30 @@ function toggleFolder(element) {
 
 // Select and load a file
 async function selectFile(fileName, clickedElement) {
+    if (fileOperationPending) return;
     if (hasUnsavedChanges) {
         if (!confirm('You have unsaved changes. Do you want to discard them?')) {
             return;
         }
     }
 
-    // Release previous lock
-    if (currentLockId) {
-        await releaseLock();
+    fileOperationPending = true;
+    fileLoaded = false;
+    editorContextVersion++;
+    conflictServerHash = null;
+    document.getElementById('conflictModal').classList.remove('active');
+    editor.value = '';
+    currentDocumentType = undefined;
+    currentSource = undefined;
+    updateEditorControls();
+    // Capture and release the previous lock before loading another file.
+    try {
+        if (currentLockId) await releaseLock();
+    } catch (error) {
+        fileOperationPending = false;
+        statusText.textContent = 'Could not release the previous file lock. Try again.';
+        updateEditorControls();
+        return;
     }
 
     // Update UI
@@ -192,17 +241,20 @@ async function selectFile(fileName, clickedElement) {
 
     try {
         // Read file
-        const response = await fetch(`/api/mission-files/${serverId}/${fileName}`);
+        const response = await fetch(`/api/mission-files/${serverId}/${encodedFilePath(fileName)}`);
         const data = await response.json();
 
         if (data.success) {
             editor.value = data.content;
+            currentDocumentType = data.documentType || undefined;
+            currentSource = data.source;
+            fileLoaded = true;
             originalHash = data.hash;
             conflictServerHash = null;
             hasUnsavedChanges = false;
 
             // Acquire lock
-            const lockResponse = await fetchWithCsrf(`/api/mission-files/${serverId}/${fileName}/lock`, {
+            const lockResponse = await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(fileName)}/lock`, {
                 method: 'POST',
                 body: JSON.stringify({ lockHolder: 'dashboard', timeoutMs: 300000 })
             });
@@ -236,12 +288,16 @@ async function selectFile(fileName, clickedElement) {
         console.error('Failed to load file:', error);
         const message = error.message || 'Unknown error';
         alert(`Failed to load file: ${message}\n\nPlease try refreshing the page or contact support if the issue persists.`);
+    } finally {
+        fileOperationPending = false;
+        updateEditorControls();
     }
 }
 
 // Format / Lint file
 formatBtn.addEventListener('click', async () => {
-    if (!currentFile) return;
+    if (!fileLoaded || fileOperationPending) return;
+    doctor.invalidate();
 
     try {
         const content = editor.value;
@@ -281,7 +337,7 @@ function formatXML(xml) {
             indent = 0;
         } else if (node.match(/^<\/\w/) && pad > 0) {
             pad -= 1;
-        } else if (node.match(/^<\w[^>]*[^\/]>.*$/)) {
+        } else if (node.match(/^<\w[^>]*[^/]>.*$/)) {
             indent = 1;
         } else {
             indent = 0;
@@ -295,6 +351,7 @@ function formatXML(xml) {
 
 // Track changes
 editor.addEventListener('input', () => {
+    doctor.invalidate();
     if (currentFile) {
         hasUnsavedChanges = true;
         statusText.textContent = '✏️ Modified (unsaved)';
@@ -304,14 +361,16 @@ editor.addEventListener('input', () => {
 
 // Save file
 saveBtn.addEventListener('click', async () => {
-    if (!currentFile || !currentLockId) return;
+    if (!fileLoaded || !currentFile || !currentLockId || fileOperationPending) return;
+    fileOperationPending = true;
+    updateEditorControls();
 
     statusText.textContent = 'Saving...';
     saveBtn.disabled = true;
 
     try {
         // Check for conflicts
-        const conflictResponse = await fetchWithCsrf(`/api/mission-files/${serverId}/${currentFile}/check-conflict`, {
+        const conflictResponse = await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}/check-conflict`, {
             method: 'POST',
             body: JSON.stringify({ expectedHash: originalHash })
         });
@@ -321,12 +380,11 @@ saveBtn.addEventListener('click', async () => {
         if (conflictData.hasConflict) {
             conflictServerHash = conflictData.currentHash;
             document.getElementById('conflictModal').classList.add('active');
-            saveBtn.disabled = false;
             return;
         }
 
         // Save file
-        const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${currentFile}`, {
+        const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}`, {
             method: 'PUT',
             body: JSON.stringify({
                 content: editor.value,
@@ -344,7 +402,7 @@ saveBtn.addEventListener('click', async () => {
             conflictServerHash = null;
             hasUnsavedChanges = false;
             statusText.textContent = '✅ Saved and verified on Nitrado';
-
+            currentSource = undefined;
             // Show success indicator
             refreshIndicator.classList.add('active');
             setTimeout(() => {
@@ -359,9 +417,10 @@ saveBtn.addEventListener('click', async () => {
         const message = error.message || 'Unknown error';
         alert(`Failed to save file: ${message}\n\nPlease try again or contact support if the issue persists.`);
         statusText.textContent = '❌ Save failed';
+    } finally {
+        fileOperationPending = false;
+        updateEditorControls();
     }
-
-    saveBtn.disabled = false;
 });
 
 // Reload file
@@ -369,7 +428,7 @@ reloadBtn.addEventListener('click', async () => {
     if (!currentFile) return;
 
     if (hasUnsavedChanges) {
-        if (!confirm('Discard unsaved changes and reload from server?')) {
+        if (!confirm('Discard unsaved changes and reload the local working copy?')) {
             return;
         }
     }
@@ -384,7 +443,7 @@ diffBtn.addEventListener('click', async () => {
     statusText.textContent = 'Checking for changes...';
 
     try {
-        const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${currentFile}/check-conflict`, {
+        const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}/check-conflict`, {
             method: 'POST',
             body: JSON.stringify({ expectedHash: originalHash })
         });
@@ -392,9 +451,9 @@ diffBtn.addEventListener('click', async () => {
         const data = await response.json();
 
         if (data.hasConflict) {
-            alert('⚠️ The file has been modified on the server!\n\nExpected hash: ' + data.expectedHash + '\nCurrent hash: ' + data.currentHash);
+            alert('⚠️ The local working copy has changed!\n\nExpected hash: ' + data.expectedHash + '\nCurrent hash: ' + data.currentHash);
         } else {
-            alert('✅ No changes detected on the server');
+            alert('✅ No changes detected in the local working copy; provider freshness is unknown');
         }
 
         statusText.textContent = 'Ready';
@@ -408,7 +467,7 @@ diffBtn.addEventListener('click', async () => {
 // Release lock
 async function releaseLock() {
     if (currentLockId && currentFile) {
-        await fetchWithCsrf(`/api/mission-files/${serverId}/${currentFile}/unlock`, {
+        await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}/unlock`, {
             method: 'POST',
             body: JSON.stringify({ lockId: currentLockId })
         });
@@ -418,10 +477,13 @@ async function releaseLock() {
 
 // Release all locks
 releaseLockBtn.addEventListener('click', async () => {
+    if (fileOperationPending) return;
     if (!confirm('Release all locks on this server? This will allow other users to edit files.')) {
         return;
     }
 
+    fileOperationPending = true;
+    updateEditorControls();
     try {
         const response = await fetchWithCsrf('/api/mission-files/release-all-locks', {
             method: 'POST',
@@ -435,6 +497,9 @@ releaseLockBtn.addEventListener('click', async () => {
         console.error('Failed to release locks:', error);
         const message = error.message || 'Unknown error';
         alert(`Failed to release locks: ${message}\n\nPlease try again.`);
+    } finally {
+        fileOperationPending = false;
+        updateEditorControls();
     }
 });
 
@@ -479,25 +544,40 @@ document.getElementById('fileTree').addEventListener('click', (e) => {
 async function resolveConflict(action) {
     document.getElementById('conflictModal').classList.remove('active');
 
+    if (!fileLoaded || fileOperationPending) return;
     if (action === 'overwrite') {
-        // Force save
-        const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${currentFile}`, {
-            method: 'PUT',
-            body: JSON.stringify({
-                content: editor.value,
-                lockId: currentLockId,
-                createBackup: true,
-                uploadToNitrado: true,
-                expectedHash: conflictServerHash
-            })
-        });
+        if (!currentLockId || !conflictServerHash) return;
+        fileOperationPending = true;
+        updateEditorControls();
+        try {
+            // Save with both the local conflict hash and provider verification.
+            const response = await fetchWithCsrf(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                    content: editor.value,
+                    lockId: currentLockId,
+                    createBackup: true,
+                    uploadToNitrado: true,
+                    expectedHash: conflictServerHash
+                })
+            });
 
-        const data = await response.json();
-        if (data.success) {
-            originalHash = data.hash;
-            conflictServerHash = null;
-            hasUnsavedChanges = false;
-            statusText.textContent = '✅ Saved (overwrote server version)';
+            const data = await response.json();
+            if (data.success) {
+                originalHash = data.hash;
+                conflictServerHash = null;
+                hasUnsavedChanges = false;
+                currentSource = undefined;
+                statusText.textContent = '✅ Saved and verified on Nitrado';
+            } else {
+                throw new Error(data.error || 'Save failed');
+            }
+        } catch (error) {
+            statusText.textContent = '❌ Save failed';
+            alert('Failed to save: ' + error.message);
+        } finally {
+            fileOperationPending = false;
+            updateEditorControls();
         }
     } else if (action === 'reload') {
         await selectFile(currentFile, null);
@@ -524,10 +604,11 @@ window.addEventListener('beforeunload', (e) => {
 // Release lock on page unload
 window.addEventListener('unload', () => {
     if (currentLockId) {
-        navigator.sendBeacon(`/api/mission-files/${serverId}/${currentFile}/unlock`,
+        navigator.sendBeacon(`/api/mission-files/${serverId}/${encodedFilePath(currentFile)}/unlock`,
             JSON.stringify({ lockId: currentLockId }));
     }
 });
 
 // Initialize
+updateEditorControls();
 loadFileList();

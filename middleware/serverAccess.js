@@ -1,6 +1,7 @@
 /* eslint-disable require-atomic-updates */
 const {
   CAPABILITIES,
+  authorizePlatformServer,
   authorizeServer,
 } = require('../services/authorizationService');
 
@@ -53,6 +54,48 @@ async function ensureServerOwner(req, res, next) {
  */
 async function ensureServerAccess(req, res, next) {
   return requireServerCapability(CAPABILITIES.SERVER_MANAGE)(req, res, next);
+}
+
+/** Resolve a platform service ID, authorize an exact-server capability, and attach canonical context. */
+function requirePlatformServerCapability(capability) {
+  return async function platformServerCapabilityMiddleware(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: 'Not authenticated' });
+    const serverCandidates = [
+      req.params?.serverId, req.params?.serviceId, req.params?.platformServerId,
+      req.query?.serverId, req.query?.platformServerId,
+      req.body?.serverId, req.body?.platformServerId,
+    ].filter(candidate => candidate !== undefined && candidate !== null && candidate !== '').map(String);
+    const guildCandidates = [req.params?.guildId, req.query?.guildId, req.body?.guildId]
+      .filter(candidate => candidate !== undefined && candidate !== null && candidate !== '').map(String);
+    if (new Set(serverCandidates).size !== 1 || new Set(guildCandidates).size > 1) {
+      return res.status(400).json({ error: 'Conflicting or missing resource identifiers' });
+    }
+
+    try {
+      const context = await authorizePlatformServer(
+        req.app.locals.db,
+        req.user,
+        serverCandidates[0],
+        capability
+      );
+      const requestedGuildId = guildCandidates[0] || null;
+      if (!context || (requestedGuildId && requestedGuildId !== String(context.guild.id) &&
+          requestedGuildId !== String(context.guild.discordGuildId))) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+      req.authorization = context;
+      req.platformServerAccess = {
+        serverId: context.server.id,
+        guildId: context.guild.id,
+        discordGuildId: context.guild.discordGuildId,
+        platformServerId: context.server.platformServerId,
+      };
+      return next();
+    } catch (error) {
+      console.error('❌ Platform server authorization failed:', error.message);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  };
 }
 
 /** Require owner/admin authority for the exact Nitrado service and approved guild. */
@@ -237,6 +280,40 @@ async function ensureHasOperableServers(req, res, next) {
     return next();
   } catch (err) {
     console.error('❌ Database error checking operable server access:', err.message);
+    return res.status(500).json({ error: 'Database error' });
+  }
+}
+
+async function ensureHasModeratableServers(req, res, next) {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+
+  try {
+    const row = await req.app.locals.db.get(
+      `SELECT s.id
+         FROM servers s
+         JOIN guilds g ON g.id = s.guild_id
+         LEFT JOIN guild_roles gr
+           ON gr.guild_id = g.id AND gr.user_id = ? AND gr.role IN ('owner', 'admin')
+         LEFT JOIN server_role_assignments sra
+           ON sra.server_id = s.id AND sra.guild_id = s.guild_id
+          AND sra.user_id = ? AND sra.role IN ('admin', 'moderator') AND sra.status = 'active'
+        WHERE g.status = 'approved' AND s.status = 'active'
+          AND (gr.user_id IS NOT NULL OR sra.user_id IS NOT NULL)
+        LIMIT 1`,
+      [req.user.id, req.user.id]
+    );
+    if (!row) {
+      if (req.originalUrl.startsWith('/api/')) {
+        return res.status(403).json({ error: 'You do not have access to any moderated servers.' });
+      }
+      return res.redirect('/dashboard?error=no_servers');
+    }
+    req.serverInfo = row;
+    return next();
+  } catch (error) {
+    console.error('❌ Database error checking moderated server access:', error.message);
     return res.status(500).json({ error: 'Database error' });
   }
 }
@@ -544,12 +621,14 @@ module.exports = {
   ensureServerAccess,
   ensureGuildOwner,
   ensureHasOperableServers,
+  ensureHasModeratableServers,
   ensureHasServers,
   ensureApproved,
   ensurePlayerApproved,
   ensurePlayerGuildAccess,
   ensurePlayerIdentityAccess,
   ensurePlayerServerAccess,
+  requirePlatformServerCapability,
   ensurePlatformServerOwner,
   ensureApprovedGuildOperator
 };

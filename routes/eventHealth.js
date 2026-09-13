@@ -1,14 +1,15 @@
 'use strict';
 
 const express = require('express');
-const { ensurePlatformServerOwner } = require('../middleware/serverAccess');
+const { requirePlatformServerCapability, CAPABILITIES } = require('../middleware/serverAccess');
+const requireOperationsMapAccess = requirePlatformServerCapability(CAPABILITIES.SERVER_MODERATE);
 const { getGuildDownloadPath } = require('../services/logSyncService');
 const { getEventHealth } = require('../services/eventHealthService');
 const { MISSION_SUBDIRS } = require('../utils/dayzPlatform');
 
 const router = express.Router();
 
-router.get('/', ensurePlatformServerOwner, async (req, res) => {
+router.get('/', requireOperationsMapAccess, async (req, res) => {
   const mapName = String(req.query.map || '').toLowerCase();
   if (!/^[a-z0-9]+$/.test(mapName)) {
     return res.status(400).json({ success: false, error: 'A valid map is required' });

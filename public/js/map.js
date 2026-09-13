@@ -38,6 +38,17 @@ let deathHeatmapEnabled = false;
 let movementHeatLayer = null;
 let movementHeatmapEnabled = false;
 
+// Staff operations overlay (log-derived, exact-server scoped)
+let operationsRequestId = 0;
+const operationsLayers = {
+  players: null,
+  events: null,
+  purchases: null,
+  territory: null,
+  zones: null,
+  factions: null,
+};
+
 // Stats tracking
 let previousStats = {
   spawns: 0,
@@ -167,13 +178,13 @@ function resetAllColors() {
 
 // Initialize map
 function initMap(mapName = 'enoch') {
+  const resolvedMapName = mapConfigs[mapName] ? mapName : 'enoch';
+  const mapConfig = mapConfigs[resolvedMapName];
+  const size = mapConfig.size;
   if (map) {
     currentTiles.forEach(tile => tile.remove());
     currentTiles = [];
   } else {
-    const mapConfig = mapConfigs[mapName] || mapConfigs['enoch'];
-    const size = mapConfig.size;
-
     map = L.map('map', {
       crs: L.CRS.Simple,
       minZoom: -2,
@@ -184,15 +195,14 @@ function initMap(mapName = 'enoch') {
       attributionControl: false
     });
 
-    const bounds = L.latLngBounds([[0, 0], [size, size]]);
-    map.setMaxBounds(bounds.pad(0.5));
-    map.fitBounds(bounds);
     map.on('click', onMapClick);
   }
 
-  addCoordinateGrid(mapName);
+  const bounds = L.latLngBounds([[0, 0], [size, size]]);
+  map.setMaxBounds(bounds.pad(0.5));
+  map.fitBounds(bounds);
+  addCoordinateGrid(resolvedMapName);
 
-  const mapConfig = mapConfigs[mapName] || mapConfigs['enoch'];
   const gridSize = mapConfig.gridSize;
   const physicalTileSize = mapConfig.physicalSize || 512;
   const advancement = mapConfig.advancement || mapConfig.tileSize;
@@ -204,7 +214,7 @@ function initMap(mapName = 'enoch') {
         [y * advancement, x * advancement],
         [y * advancement + physicalTileSize, x * advancement + physicalTileSize]
       ]);
-      const tileUrl = '/maps/' + mapName + '/tiles/' + x + '/' + flippedY + '.png';
+      const tileUrl = '/maps/' + resolvedMapName + '/tiles/' + x + '/' + flippedY + '.png';
       const overlay = L.imageOverlay(tileUrl, tileBounds, {
         opacity: 1,
         interactive: false,
@@ -260,7 +270,7 @@ async function loadServers() {
     console.log('🔍 [MAP] Loading servers...');
 
     // Step 1: Get user's guilds
-    const guildsRes = await fetch('/api/user/guilds');
+    const guildsRes = await fetch('/api/user/moderatable-guilds');
     console.log('📡 [MAP] Guilds response status:', guildsRes.status);
 
     const guildsData = await guildsRes.json();
@@ -277,7 +287,7 @@ async function loadServers() {
     for (const guild of guildsData.guilds) {
       console.log('🔍 [MAP] Fetching servers for guild:', guild.name, guild.id);
 
-      const serversRes = await fetch(`/api/guilds/${guild.id}/servers`);
+      const serversRes = await fetch(`/api/guilds/${guild.id}/servers?scope=moderate`);
       console.log('📡 [MAP] Servers response status:', serversRes.status);
 
       const serversData = await serversRes.json();
@@ -304,6 +314,7 @@ async function loadServers() {
         const option = document.createElement('option');
         option.value = server.nitrado_server_id;
         option.dataset.guildId = String(server.guildId);
+        option.dataset.internalServerId = String(server.id);
         option.textContent = (server.server_name) + ' (' + server.nitrado_server_id + ')';
         select.appendChild(option);
       });
@@ -317,7 +328,9 @@ function selectedServerContext(serverId) {
   const select = document.getElementById('server-select');
   const option = select.options[select.selectedIndex];
   if (!option || String(option.value) !== String(serverId) || String(currentServer) !== String(serverId)) return null;
-  return option.dataset.guildId ? { guildId: option.dataset.guildId } : null;
+  return option.dataset.guildId && option.dataset.internalServerId
+    ? { guildId: option.dataset.guildId, internalServerId: option.dataset.internalServerId }
+    : null;
 }
 
 function escapeHtml(value) {
@@ -350,6 +363,20 @@ async function getActiveMission(serverId, guildId, discoveryRequestId = mapDisco
       document.getElementById('stat-players').textContent = currentPlayers + '/' + data.maxPlayers;
       updateStatTrend('players', currentPlayers, previousStats.players);
       previousStats.players = currentPlayers;
+
+      if (currentMapName && currentMapName !== data.mapName) {
+        const mapSelect = document.getElementById('map-select');
+        const activeOption = Array.from(mapSelect.options).find(option => option.value === data.mapName);
+        if (activeOption) {
+          contextGeneration++;
+          mapDataRequestId++;
+          eventHealthRequestId++;
+          clearSelectedContext();
+          mapSelect.value = data.mapName;
+          loadMapData(serverId, data.mapName);
+          loadEnabledHeatmaps();
+        }
+      }
 
       console.log('✓ Active mission:', data.mission, '→', data.mapName);
       return data.mapName;
@@ -534,8 +561,10 @@ async function loadMapData(serverId, mapName, isAutoRefresh = false) {
   if (!isAutoRefresh) {
     initMap(mapName);
     loadEventHealth(serverId, mapName, serverContext.guildId);
+    loadOperationsOverlay();
   } else {
     loadEventHealth(serverId, mapName, serverContext.guildId);
+    loadOperationsOverlay();
   }
 
   try {
@@ -1007,6 +1036,196 @@ function onMapClick(e) {
   map.getContainer().classList.remove('radius-mode');
 }
 
+function formatObservationTime(value) {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : 'unknown time';
+}
+
+function operationsPopup(title, lines) {
+  return '<strong>' + escapeHtml(title) + '</strong><br>' + lines
+    .filter(Boolean)
+    .map(line => escapeHtml(line))
+    .join('<br>');
+}
+
+function addOperationsPoint(group, item, options, title, lines) {
+  if (!item.position) return;
+  const marker = L.circleMarker(gameToLeaflet(item.position.east, item.position.north, currentMapName), options);
+  marker.bindPopup(operationsPopup(title, lines));
+  marker.addTo(group);
+}
+
+function buildOperationsLayers(snapshot) {
+  const next = {
+    players: L.layerGroup(), events: L.layerGroup(), purchases: L.layerGroup(),
+    territory: L.layerGroup(), zones: L.layerGroup(), factions: L.layerGroup(),
+  };
+
+  for (const player of snapshot.rosterPlayers || []) {
+    addOperationsPoint(next.players, player, {
+      radius: 8, color: player.positionFresh ? '#22c55e' : '#f59e0b', weight: 3,
+      fillColor: player.positionFresh ? '#16a34a' : '#d97706', fillOpacity: 0.85,
+    }, `Roster observation: ${player.gamertag}`, [
+      player.positionFresh ? 'Recent position evidence' : 'Stale position evidence',
+      `Observed: ${formatObservationTime(player.positionObservedAt)}`,
+      `X ${Math.round(player.position.east)} · Z ${Math.round(player.position.north)}`,
+    ]);
+  }
+
+  const eventStyles = {
+    kill: { color: '#ef4444', fillColor: '#dc2626' },
+    death: { color: '#a855f7', fillColor: '#9333ea' },
+    damage: { color: '#f97316', fillColor: '#ea580c' },
+  };
+  for (const event of snapshot.recentEvents || []) {
+    const style = eventStyles[event.type] || eventStyles.damage;
+    addOperationsPoint(next.events, event, {
+      radius: event.type === 'kill' ? 7 : 5, color: style.color, fillColor: style.fillColor,
+      weight: 2, fillOpacity: 0.75,
+    }, event.type.toUpperCase(), [
+      `${event.actor || 'Unknown'} → ${event.subject || 'Unknown'}`,
+      event.detail,
+      formatObservationTime(event.timestamp),
+    ]);
+  }
+
+  for (const purchase of snapshot.purchases || []) {
+    addOperationsPoint(next.purchases, purchase, {
+      radius: 7, color: '#38bdf8', fillColor: '#0284c7', weight: 2, fillOpacity: 0.8,
+    }, `Purchase: ${purchase.itemName}`, [
+      `${purchase.gamertag} · quantity ${purchase.quantity}`,
+      `${purchase.lifecycleState} · presence unknown`,
+      formatObservationTime(purchase.completedAt),
+    ]);
+  }
+
+  for (const observation of snapshot.territoryObservations || []) {
+    addOperationsPoint(next.territory, observation, {
+      radius: 6, color: '#facc15', fillColor: '#ca8a04', weight: 2, fillOpacity: 0.75,
+    }, `${observation.eventType}: ${observation.structureType}`, [
+      observation.gamertag,
+      [observation.structurePart, observation.toolUsed].filter(Boolean).join(' · '),
+      'Historical observation; current object presence unknown',
+      formatObservationTime(observation.timestamp),
+    ]);
+  }
+
+  const cfg = mapConfigs[currentMapName] || mapConfigs.enoch;
+  const radiusScale = cfg.imageWidth / cfg.worldWidth;
+  for (const zone of snapshot.zones || []) {
+    const color = zone.status === 'confirmed' ? '#ef4444' : zone.status === 'pending' ? '#f59e0b' : '#6b7280';
+    const circle = L.circle(gameToLeaflet(zone.position.east, zone.position.north, currentMapName), {
+      radius: zone.radiusMeters * radiusScale,
+      color, fillColor: color, weight: 2, fillOpacity: zone.status === 'dismissed' ? 0.04 : 0.12,
+      dashArray: zone.status === 'confirmed' ? null : '6 5',
+    });
+    circle.bindPopup(operationsPopup(zone.label || 'Review zone', [
+      `${zone.status} · ${zone.type}`,
+      `${Math.round(zone.radiusMeters)}m radius · ${zone.evidenceCount} evidence records`,
+      `Evidence: ${formatObservationTime(zone.evidenceObservedAt)}`,
+    ])).addTo(next.zones);
+  }
+
+  for (const marker of snapshot.factionMarkers || []) {
+    addOperationsPoint(next.factions, marker, {
+      radius: 7, color: '#2dd4bf', fillColor: '#0f766e', weight: 2, fillOpacity: 0.8,
+    }, `${marker.icon || '📍'} ${marker.title}`, [
+      marker.factionName,
+      marker.note,
+      'Faction annotation; not territory ownership',
+    ]);
+  }
+  return next;
+}
+
+function applyOperationsLayerVisibility() {
+  const controls = {
+    players: 'operations-player-toggle', events: 'operations-event-toggle',
+    purchases: 'operations-purchase-toggle', territory: 'operations-territory-toggle',
+    zones: 'operations-zone-toggle', factions: 'operations-faction-toggle',
+  };
+  for (const [name, controlId] of Object.entries(controls)) {
+    const layer = operationsLayers[name];
+    if (!layer || !map) continue;
+    const enabled = document.getElementById(controlId).checked;
+    if (enabled && !map.hasLayer(layer)) layer.addTo(map);
+    if (!enabled && map.hasLayer(layer)) map.removeLayer(layer);
+  }
+}
+
+function clearOperationsLayers() {
+  operationsRequestId++;
+  for (const name of Object.keys(operationsLayers)) {
+    if (operationsLayers[name] && map && map.hasLayer(operationsLayers[name])) map.removeLayer(operationsLayers[name]);
+    operationsLayers[name] = null;
+  }
+  document.getElementById('operations-counts').textContent = '';
+  document.getElementById('operations-status').textContent = 'Select a server and map to load exact-server log telemetry.';
+}
+
+async function loadOperationsOverlay() {
+  const serverContext = selectedServerContext(currentServer);
+  if (!serverContext || !currentMapName) return;
+  const mapDefinition = window.DayZMapCoordinates.getMapDefinition(currentMapName);
+  if (!mapDefinition.verifiedGeometry) {
+    clearOperationsLayers();
+    document.getElementById('operations-status').textContent =
+      'Operations overlay is unavailable because this terrain geometry is not calibrated.';
+    return;
+  }
+  const requestId = ++operationsRequestId;
+  const requestContextGeneration = contextGeneration;
+  const status = document.getElementById('operations-status');
+  status.textContent = 'Refreshing log-derived operations telemetry…';
+  try {
+    const params = new URLSearchParams({
+      map: currentMapName,
+      windowMinutes: document.getElementById('operations-window').value,
+    });
+    const response = await fetch('/api/operations-map/' + encodeURIComponent(serverContext.internalServerId) + '?' + params);
+    const result = await response.json().catch(() => ({}));
+    if (requestId !== operationsRequestId || requestContextGeneration !== contextGeneration ||
+        !selectedServerContext(currentServer)) return;
+    if (!response.ok || !result.success) {
+      clearOperationsLayers();
+      status.textContent = response.status === 403
+        ? 'Operations overlay is not available for this role.'
+        : (result.error || 'Operations telemetry is unavailable.');
+      return;
+    }
+    if (result.mapName !== currentMapName) {
+      clearOperationsLayers();
+      status.textContent = 'Operations telemetry no longer matches the selected map.';
+      return;
+    }
+
+    const nextLayers = buildOperationsLayers(result);
+    for (const name of Object.keys(operationsLayers)) {
+      if (operationsLayers[name] && map.hasLayer(operationsLayers[name])) map.removeLayer(operationsLayers[name]);
+      operationsLayers[name] = nextLayers[name];
+    }
+    applyOperationsLayerVisibility();
+    const observed = formatObservationTime(result.telemetry.presenceObservedAt);
+    const sessionStarted = formatObservationTime(result.telemetry.activeSessionStartedAt);
+    status.textContent = result.telemetry.presenceFresh
+      ? `Verified active session since ${sessionStarted} · roster observed ${observed} · snapshot ${formatObservationTime(result.generatedAt)}`
+      : `Verified active session since ${sessionStarted} · roster evidence is stale or unavailable · snapshot ${formatObservationTime(result.generatedAt)}`;
+    document.getElementById('operations-counts').textContent = [
+      `${result.rosterPlayers.length}/${result.telemetry.rosterCount} observed roster players positioned`,
+      `${result.recentEvents.length} combat events`,
+      `${result.purchases.length} purchases`,
+      `${result.territoryObservations.length} build/territory observations`,
+      `${result.zones.length} review zones`,
+      `${result.factionMarkers.length} faction markers`,
+    ].join(' · ');
+  } catch (error) {
+    if (requestId !== operationsRequestId || requestContextGeneration !== contextGeneration) return;
+    console.error('Operations map load failed:', error);
+    clearOperationsLayers();
+    status.textContent = 'Operations telemetry is unavailable.';
+  }
+}
+
 function toggleFilterPanel() {
   const panel = document.getElementById('filter-panel');
   const isMinimized = panel.classList.contains('minimized');
@@ -1087,6 +1306,8 @@ function loadEnabledHeatmaps() {
 }
 
 function clearSelectedContext() {
+  currentMapName = null;
+  clearOperationsLayers();
   Object.values(markers).forEach(marker => marker.remove());
   markers = {};
   allEventData = [];
@@ -1121,11 +1342,11 @@ document.getElementById('server-select').addEventListener('change', function(e) 
 
 document.getElementById('map-select').addEventListener('change', function(e) {
   const mapName = e.target.value;
+  contextGeneration++;
+  mapDataRequestId++;
+  eventHealthRequestId++;
+  clearSelectedContext();
   if (mapName && currentServer) {
-    contextGeneration++;
-    mapDataRequestId++;
-    eventHealthRequestId++;
-    clearSelectedContext();
     loadMapData(currentServer, mapName);
     loadEnabledHeatmaps();
   }
@@ -1170,6 +1391,12 @@ document.getElementById('search-input').addEventListener('keyup', searchEvents);
 document.getElementById('radius-btn').addEventListener('click', startRadiusSearch);
 document.getElementById('cancel-radius-btn').addEventListener('click', cancelRadiusSearch);
 document.getElementById('auto-refresh-toggle').addEventListener('change', toggleAutoRefresh);
+document.getElementById('operations-refresh').addEventListener('click', loadOperationsOverlay);
+document.getElementById('operations-window').addEventListener('change', loadOperationsOverlay);
+for (const id of ['operations-player-toggle', 'operations-event-toggle', 'operations-purchase-toggle',
+  'operations-territory-toggle', 'operations-zone-toggle', 'operations-faction-toggle']) {
+  document.getElementById(id).addEventListener('change', applyOperationsLayerVisibility);
+}
 
 // ─── Loot Despawn Heatmap ───────────────────────────────────────────────────
 

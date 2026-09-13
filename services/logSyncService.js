@@ -7,6 +7,10 @@ const telemetry = require('../utils/telemetry');
 const fs = require('fs');
 const path = require('path');
 const { decryptToken } = require('../utils/encryption');
+const {
+  ProviderLogStorageUnavailableError,
+  providerLogAvailability,
+} = require('../utils/providerLogAvailability');
 const { getNitradoBinaryBody, getNitradoFileEntries, getNitradoTransferToken } = require('../utils/nitradoHttp');
 const {
   ensureContainedDirectorySync,
@@ -15,7 +19,13 @@ const {
   writeContainedFileAtomicSync,
 } = require('../utils/safePath');
 const { inspectNitradoRootEntries } = require('../utils/dayzPlatform');
-const { compareLogFileEntries, isSupportedRptFilename } = require('../utils/logFileChronology');
+const {
+  compareLogFileEntries,
+  isSupportedAdmFilename,
+  isSupportedRptFilename,
+  logStartTimeMs,
+  parseStrictTimestampMs,
+} = require('../utils/logFileChronology');
 const { createNitradoService } = require('./nitradoService');
 
 const DOWNLOAD_ROOT = path.join(__dirname, '..', 'downloads');
@@ -236,6 +246,15 @@ function localFileMatchesBody(localPath, fileBody) {
   }
 }
 
+class IncompleteLogDownloadError extends Error {
+  constructor(expectedBytes, receivedBytes) {
+    super('Nitrado returned an incomplete log file download');
+    this.name = 'IncompleteLogDownloadError';
+    this.expectedBytes = expectedBytes;
+    this.receivedBytes = receivedBytes;
+  }
+}
+
 async function downloadLogFile(token, serverId, file, localPath) {
   const expectedBytes = Number(file.size);
   if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0 || expectedBytes > MAX_LOG_FILE_BYTES) {
@@ -258,8 +277,8 @@ async function downloadLogFile(token, serverId, file, localPath) {
     const fileBody = getNitradoBinaryBody(fileRes);
     const fileBodyBuffer = Buffer.isBuffer(fileBody) ? fileBody : Buffer.from(fileBody);
     const receivedBytes = Number(fileBodyBuffer.byteLength);
-    if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0 || receivedBytes !== expectedBytes) {
-      throw new Error('Nitrado returned an incomplete log file download');
+    if (receivedBytes !== expectedBytes) {
+      throw new IncompleteLogDownloadError(expectedBytes, receivedBytes);
     }
     if (localFileMatchesBody(localPath, fileBodyBuffer)) {
       telemetry.incr('download.bytes', receivedBytes);
@@ -291,6 +310,32 @@ function getLogSyncConfigEntries(response) {
     },
   });
   return { listedLogEntries, validatedOtherEntries };
+}
+
+async function downloadActiveServerLog(token, serverId, file, localPath, {
+  gameserver,
+  configPathOnProvider,
+} = {}) {
+  try {
+    return await downloadLogFile(token, serverId, file, localPath);
+  } catch (error) {
+    const active = String(gameserver?.status || '').toLowerCase() === 'started';
+    if (!(error instanceof IncompleteLogDownloadError) || !active || !configPathOnProvider) {
+      throw error;
+    }
+
+    const listRes = await http.get(
+      `https://api.nitrado.net/services/${serverId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`,
+      { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 }
+    );
+    const configEntries = getLogSyncConfigEntries(listRes);
+    const refreshedEntry = configEntries.validatedOtherEntries
+      .filter(entry => entry?.type === 'file')
+      .map(entry => validateLogFileEntry(configPathOnProvider, entry))
+      .find(entry => entry.name === 'server.log');
+    if (!refreshedEntry) throw error;
+    return downloadLogFile(token, serverId, refreshedEntry, localPath);
+  }
 }
 
 function validateLogArtifactSizes(logFiles) {
@@ -330,21 +375,91 @@ function compareProviderModifiedAt(left, right) {
   );
 }
 
+function providerModifiedAtMs(value) {
+  let parsed = null;
+  if (value instanceof Date) {
+    parsed = value.getTime();
+  } else if (typeof value === 'number' && Number.isFinite(value)) {
+    parsed = Math.abs(value) < 1e12 ? value * 1000 : value;
+  } else if (typeof value === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim())) {
+    const numeric = Number(value);
+    parsed = Math.abs(numeric) < 1e12 ? numeric * 1000 : numeric;
+  } else {
+    parsed = parseStrictTimestampMs(value);
+  }
+  const minimum = Date.UTC(2000, 0, 1);
+  const maximum = Date.UTC(2100, 0, 1);
+  return Number.isFinite(parsed) && parsed >= minimum && parsed < maximum ? parsed : null;
+}
+
+function selectLatestAdmEntries(logFiles) {
+  const supported = [...logFiles].filter(file => isSupportedAdmFilename(file?.name));
+  for (const file of supported) {
+    if (providerModifiedAtMs(file.modified_at) === null) {
+      throw new Error(`Provider returned invalid modified_at for ADM file ${file.name}`);
+    }
+  }
+  return supported
+    .sort((left, right) => {
+      const providerOrder = providerModifiedAtMs(left.modified_at) - providerModifiedAtMs(right.modified_at);
+      return providerOrder || compareLogFileEntries(
+        { name: left.name, mtimeMs: providerModifiedAtMs(left.modified_at) },
+        { name: right.name, mtimeMs: providerModifiedAtMs(right.modified_at) }
+      );
+    })
+    .slice(-2);
+}
+
+function activeRptPathForGameserver(logFiles, gameserver) {
+  if (gameserver?.status !== 'started') return null;
+  const startedAtMs = providerModifiedAtMs(gameserver.last_status_change);
+  if (startedAtMs === null) return null;
+  const newestRpt = [...logFiles]
+    .filter(file => isSupportedRptFilename(file?.name))
+    .sort((left, right) => compareLogFileEntries(
+      { name: left.name, mtimeMs: Number(left.modified_at || 0) },
+      { name: right.name, mtimeMs: Number(right.modified_at || 0) }
+    ))
+    .at(-1);
+  if (!newestRpt) return null;
+
+  // A matching filename alone is ambiguous on fixed whole-hour restart
+  // schedules. Require provider metadata showing this generation was observed
+  // during the current session; otherwise keep strict transfer validation.
+  const modifiedAtMs = providerModifiedAtMs(newestRpt.modified_at);
+  if (modifiedAtMs === null || modifiedAtMs < startedAtMs) return null;
+
+  const filenameStartMs = logStartTimeMs(newestRpt.name);
+  if (!Number.isFinite(filenameStartMs)) return null;
+  const hourMs = 60 * 60 * 1000;
+  const difference = startedAtMs - filenameStartMs;
+  const timezoneHours = Math.round(difference / hourMs);
+  if (Math.abs(timezoneHours) > 14 || Math.abs(difference - timezoneHours * hourMs) > 10 * 60 * 1000) {
+    return null;
+  }
+  return newestRpt.path || newestRpt.name;
+}
+
 function selectLogSyncBatch(configPath, logFiles, {
   maxFiles = 8,
   maxBytes = MAX_LOG_BATCH_BYTES,
+  gameserver = null,
 } = {}) {
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
     throw new Error('Invalid routine log synchronization batch limits');
   }
   const validatedLogFiles = validateLogArtifactSizes(logFiles);
-  const sorted = [...validatedLogFiles].sort((left, right) => compareLogFileEntries(
+  const activeRptPath = activeRptPathForGameserver(validatedLogFiles, gameserver);
+  const eligibleLogFiles = activeRptPath === null
+    ? validatedLogFiles
+    : validatedLogFiles.filter(file => (file.path || file.name) !== activeRptPath);
+  const sorted = [...eligibleLogFiles].sort((left, right) => compareLogFileEntries(
     { name: left.name, mtimeMs: Number(left.modified_at || 0) },
     { name: right.name, mtimeMs: Number(right.modified_at || 0) }
   ));
   const recent = [
-    ...validatedLogFiles
+    ...eligibleLogFiles
       .filter(file => file.name.toUpperCase().endsWith('.ADM'))
       .sort(compareProviderModifiedAt)
       .slice(-2),
@@ -419,7 +534,11 @@ function buildRestartEvidence(configPath, gameserver, serverLogPath, logFiles) {
   };
 }
 
-async function performLogSync(db, userId, token, serverIds) {
+async function performLogSync(db, userId, token, serverIds, {
+  respectAvailabilityBackoff = false,
+  availabilityTracker = providerLogAvailability,
+  nowMs = Date.now,
+} = {}) {
   // legacy sync — keep for backwards compatibility
   let totalFilesDownloaded = 0;
   let totalFilesUpdated = 0;
@@ -448,6 +567,10 @@ async function performLogSync(db, userId, token, serverIds) {
       console.log(`\n📥 Syncing logs from server ${serverId}...`);
       const authorizedServer = await resolveOperationalServer(db, userId, serverId, token);
       if (!authorizedServer) { recordError(serverId, `Server ${serverId}: Could not authorize server credentials`); continue; }
+      if (respectAvailabilityBackoff && !availabilityTracker.canAttempt(serverId, nowMs())) {
+        recordError(serverId, `Server ${serverId}: DayZ log storage is temporarily backed off`);
+        continue;
+      }
       const guildDiscordId = authorizedServer.guildDiscordId;
 
       const serverPath = getGuildDownloadPath(guildDiscordId, serverId);
@@ -462,7 +585,12 @@ async function performLogSync(db, userId, token, serverIds) {
       console.log(`   📁 Root entries: ${entries.map(e => e.name).join(', ')}`);
 
       const structure = inspectNitradoRootEntries(entries, gameserver);
-      if (!structure.configPath) { recordError(serverId, `Server ${serverId}: No DayZ config directory found`); continue; }
+      if (!structure.configPath) {
+        availabilityTracker.recordUnavailable(serverId, nowMs());
+        recordError(serverId, `Server ${serverId}: No DayZ config directory found`);
+        continue;
+      }
+      availabilityTracker.recordAvailable(serverId);
       const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
       const configListRes = await http.get(`https://api.nitrado.net/services/${serverId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`, { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 });
       const configEntries = getLogSyncConfigEntries(configListRes);
@@ -481,9 +609,9 @@ async function performLogSync(db, userId, token, serverIds) {
           blocksRptParsing: /\.RPT$/i.test(file.name),
         });
       }
-      const logFiles = selectLogSyncBatch(configPath, preflight.accepted);
+      const logFiles = selectLogSyncBatch(configPath, preflight.accepted, { gameserver });
       const serverLogEntry = configFiles.find(f => f.type === 'file' && f.name === 'server.log');
-      if (logFiles.length === 0) {
+      if (preflight.accepted.length === 0) {
         recordError(serverId, `Server ${serverId}: No ADM/RPT log files found`);
       }
       if (!serverLogEntry) {
@@ -498,7 +626,10 @@ async function performLogSync(db, userId, token, serverIds) {
         try {
           const fileState = classifyLogEntry(configPath, serverLogEntry);
           if (fileState) {
-            const changed = await downloadLogFile(token, serverId, serverLogEntry, localPath);
+            const changed = await downloadActiveServerLog(token, serverId, serverLogEntry, localPath, {
+              gameserver,
+              configPathOnProvider,
+            });
             if (!changed) totalFilesSkipped++;
             else if (fileState === 'new') totalFilesDownloaded++;
             else totalFilesUpdated++;
@@ -547,7 +678,7 @@ async function performLogSync(db, userId, token, serverIds) {
         configPath,
         gameserver,
         serverLogLocalPath,
-        logFiles
+        preflight.accepted
       );
       if (serverChanged) changedServerIds.push(String(serverId));
     } catch (serverErr) { console.error(`❌ Error syncing server ${serverId}:`, serverErr.message); recordError(serverId, `Server ${serverId}: ${serverErr.message}`); }
@@ -567,7 +698,18 @@ async function performLogSync(db, userId, token, serverIds) {
   };
 }
 
-async function performLogSyncConcurrent(db, userId, token, serverIds, authorizedServers = null) {
+async function performLogSyncConcurrent(
+  db,
+  userId,
+  token,
+  serverIds,
+  authorizedServers = null,
+  {
+    respectAvailabilityBackoff = false,
+    availabilityTracker = providerLogAvailability,
+    nowMs = Date.now,
+  } = {}
+) {
   const globalConcurrency = parseInt(process.env.LOGSYNC_GLOBAL_CONCURRENCY || '2', 10);
   const perServerConcurrency = parseInt(process.env.LOGSYNC_PER_SERVER_CONCURRENCY || '3', 10);
 
@@ -616,6 +758,10 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
         const authorizedServer = authorizedServers?.get(String(serverId)) ||
           await resolveOperationalServer(db, userId, serverId, token);
         if (!authorizedServer) { recordError(serverId, `Server ${serverId}: Could not authorize server credentials`); return; }
+        if (respectAvailabilityBackoff && !availabilityTracker.canAttempt(serverId, nowMs())) {
+          recordError(serverId, `Server ${serverId}: DayZ log storage is temporarily backed off`);
+          return;
+        }
         const guildDiscordId = authorizedServer.guildDiscordId;
 
         const serverPath = getGuildDownloadPath(guildDiscordId, serverId);
@@ -628,7 +774,12 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
         ]);
         const entries = getNitradoFileEntries(listRes);
         const structure = inspectNitradoRootEntries(entries, gameserver);
-        if (!structure.configPath) { recordError(serverId, `Server ${serverId}: No DayZ config directory found`); return; }
+        if (!structure.configPath) {
+          availabilityTracker.recordUnavailable(serverId, nowMs());
+          recordError(serverId, `Server ${serverId}: No DayZ config directory found`);
+          return;
+        }
+        availabilityTracker.recordAvailable(serverId);
         const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
         const configListRes = await http.get(`https://api.nitrado.net/services/${serverId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`, { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 });
 
@@ -647,9 +798,9 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
             blocksRptParsing: /\.RPT$/i.test(file.name),
           });
         }
-        const logFiles = selectLogSyncBatch(configPath, preflight.accepted);
+        const logFiles = selectLogSyncBatch(configPath, preflight.accepted, { gameserver });
         const serverLogEntry = configFiles.find(f => f.type === 'file' && f.name === 'server.log');
-        if (logFiles.length === 0) {
+        if (preflight.accepted.length === 0) {
           recordError(serverId, `Server ${serverId}: No ADM/RPT log files found`);
         }
         if (!serverLogEntry) {
@@ -667,7 +818,10 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
             try {
               const fileState = classifyLogEntry(configPath, serverLogEntry);
               if (fileState) {
-                const changed = await downloadLogFile(token, serverId, serverLogEntry, localPath);
+                const changed = await downloadActiveServerLog(token, serverId, serverLogEntry, localPath, {
+                  gameserver,
+                  configPathOnProvider,
+                });
                 if (!changed) totalFilesSkipped++;
                 else if (fileState === 'new') totalFilesDownloaded++;
                 else totalFilesUpdated++;
@@ -714,7 +868,7 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
           configPath,
           gameserver,
           serverLogLocalPath,
-          logFiles
+          preflight.accepted
         );
         if (serverChanged) changedServerIds.push(String(serverId));
 
@@ -738,6 +892,70 @@ async function performLogSyncConcurrent(db, userId, token, serverIds, authorized
   };
 }
 
+async function syncLatestAdmForExactServer(db, serverId, token, {
+  authorizeServer = resolveOperationalServerByInternalId,
+  getRawGameserver = (...args) => nitradoService.getRawGameserver(...args),
+  httpGet = (...args) => http.get(...args),
+  downloadFile = downloadLogFile,
+} = {}) {
+  const server = await authorizeServer(db, serverId, token);
+  if (!server || Number(server.id) !== Number(serverId)) {
+    throw new Error(`Active exact server ${serverId} could not be authorized for ADM sync`);
+  }
+
+  const platformServerId = String(server.platformServerId);
+  const serverPath = getGuildDownloadPath(server.guildDiscordId, platformServerId);
+  const configPath = path.join(serverPath, 'config');
+  ensureContainedDirectorySync(DOWNLOAD_ROOT, path.relative(DOWNLOAD_ROOT, configPath));
+
+  const [gameserver, listRes] = await Promise.all([
+    getRawGameserver(token, platformServerId),
+    httpGet(
+      `https://api.nitrado.net/services/${platformServerId}/gameservers/file_server/list`,
+      { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 }
+    ),
+  ]);
+  const structure = inspectNitradoRootEntries(getNitradoFileEntries(listRes), gameserver);
+  if (!structure.configPath) throw new ProviderLogStorageUnavailableError(platformServerId);
+
+  const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
+  const configListRes = await httpGet(
+    `https://api.nitrado.net/services/${platformServerId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`,
+    { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 }
+  );
+  const configEntries = getLogSyncConfigEntries(configListRes);
+  const listedAdmEntries = configEntries.listedLogEntries.filter(entry => /\.ADM$/i.test(entry?.name || ''));
+  const preflight = preflightLogArtifacts(configPathOnProvider, configPath, listedAdmEntries);
+  if (preflight.rejected.length > 0) {
+    throw new Error(`Nitrado returned ${preflight.rejected.length} invalid ADM artifact(s)`);
+  }
+
+  const selected = selectLatestAdmEntries(preflight.accepted);
+  if (selected.length === 0) throw new Error('No ADM log files found');
+
+  let changed = false;
+  for (const entry of selected) {
+    const localPath = path.join(configPath, entry.name);
+    if (await downloadFile(token, platformServerId, entry, localPath)) changed = true;
+  }
+
+  const latest = selected[selected.length - 1];
+  return {
+    changed,
+    platformServerId,
+    marker: selected.map(entry => `${entry.name}:${entry.modified_at ?? ''}:${entry.size}`).join('|'),
+    admFiles: selected.map(entry => ({
+      name: entry.name,
+      remotePath: entry.path,
+      localPath: path.join(configPath, entry.name),
+      size: entry.size,
+      modifiedAt: entry.modified_at ?? null,
+    })),
+    sourceObservedAt: latest.modified_at ?? null,
+    sourceObservedLogFile: path.join(configPath, latest.name),
+  };
+}
+
 async function performExactServerLogSync(db, serverId, token) {
   const server = await resolveOperationalServerByInternalId(db, serverId, token);
   if (!server) throw new Error(`Active exact server ${serverId} could not be authorized for log sync`);
@@ -755,6 +973,8 @@ module.exports = {
   normalizeNitradoFilePath,
   validateLogFileEntry,
   classifyLogEntry,
+  selectLatestAdmEntries,
+  providerModifiedAtMs,
   selectLogSyncBatch,
   buildRestartEvidence,
   getGuildDownloadPath,
@@ -764,7 +984,9 @@ module.exports = {
   resolveOperationalServer,
   resolveOperationalServerByInternalId,
   getDecryptedToken,
+  downloadActiveServerLog,
   downloadLogFile,
+  syncLatestAdmForExactServer,
   performLogSync,
   performLogSyncConcurrent,
   performExactServerLogSync,

@@ -382,6 +382,35 @@
       <div id="event-health-results" class="mt-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2"></div>
       <p id="event-health-limit" class="text-xs text-gray-500 mt-3"></p>
     </section>
+
+    <section id="operations-panel" class="bg-gray-800 rounded-lg p-4 mb-4 shadow-lg">
+      <div class="flex justify-between items-center gap-3 flex-wrap">
+        <div>
+          <h2 class="font-bold">🛰️ Staff Operations Overlay</h2>
+          <p id="operations-status" class="text-sm text-gray-400">Select a server and map to load exact-server log telemetry.</p>
+        </div>
+        <div class="flex gap-2 items-center flex-wrap">
+          <label class="text-xs text-gray-400" for="operations-window">Recent events</label>
+          <select id="operations-window" class="bg-gray-700 px-2 py-1 rounded text-sm">
+            <option value="15">15 minutes</option>
+            <option value="60" selected>1 hour</option>
+            <option value="360">6 hours</option>
+            <option value="1440">24 hours</option>
+          </select>
+          <button id="operations-refresh" class="btn-small btn-success" type="button">Refresh overlay</button>
+        </div>
+      </div>
+      <div class="flex gap-4 flex-wrap mt-3 text-sm">
+        <label class="filter-checkbox"><input type="checkbox" id="operations-player-toggle" checked> Roster observations</label>
+        <label class="filter-checkbox"><input type="checkbox" id="operations-event-toggle" checked> Combat events</label>
+        <label class="filter-checkbox"><input type="checkbox" id="operations-purchase-toggle" checked> Purchases</label>
+        <label class="filter-checkbox"><input type="checkbox" id="operations-territory-toggle" checked> Build/territory observations</label>
+        <label class="filter-checkbox"><input type="checkbox" id="operations-zone-toggle" checked> Review zones</label>
+        <label class="filter-checkbox"><input type="checkbox" id="operations-faction-toggle" checked> Faction markers</label>
+      </div>
+      <div id="operations-counts" class="text-xs text-gray-500 mt-2"></div>
+      <p class="text-xs text-yellow-400 mt-2">Log-derived, near-live telemetry—not real-time GPS. Purchase and build markers are historical observations; they do not prove an object is still present. Faction markers are annotations, not territory ownership.</p>
+    </section>
     <div id="map-container" class="relative">
       <div id="map" class="rounded-lg shadow-lg"></div>
 

@@ -1731,19 +1731,29 @@ function testCriticalNitradoRoutersMountExactServerGuards() {
     throw new Error('Log parser router lacks exact platform-server authorization');
   }
 
-  for (const routeName of ['tasks', 'serverControl', 'backups', 'serverStats', 'activityLog', 'console']) {
+  for (const routeName of ['tasks', 'serverControl', 'backups', 'activityLog', 'console']) {
     const protectedRouter = require(`../routes/${routeName}`);
     if (!mountedNames(protectedRouter).includes('ensureServerOwner')) {
       throw new Error(`${routeName} router lacks exact internal-server owner middleware`);
     }
   }
 
+  const serverStatsSource = require('fs').readFileSync(
+    path.join(__dirname, '..', 'routes/serverStats.js'),
+    'utf8'
+  );
+  if (!serverStatsSource.includes('requireServerCapability(CAPABILITIES.SERVER_MODERATE)')) {
+    throw new Error('serverStats router lacks exact internal-server moderator capability');
+  }
+
   const registerRoutesSource = require('fs').readFileSync(
     path.join(__dirname, '..', 'src/app/registerRoutes.js'),
     'utf8'
   );
+  if (!/server-active-mission\/:serverId'[^\n]*ensurePlatformServerModerator/.test(registerRoutesSource)) {
+    throw new Error("'/api/server-active-mission/:serverId' lacks exact moderator platform-server authorization");
+  }
   for (const routePath of [
-    "'/api/server-active-mission/:serverId'",
     "'/api/detect-structure/:serverId'",
     "'/api/sync-server'",
     "'/api/list-files'",
@@ -3054,8 +3064,9 @@ function testFeedConfigurationIsExactServerScoped() {
   }
 
   const requiredWorker = [
-    'SELECT DISTINCT guild_id, server_id FROM feed_events',
-    'processServerFeedEvents(db, guild_id, server_id)',
+    'SELECT DISTINCT fe.guild_id, fe.server_id',
+    'JOIN guilds g ON g.discord_guild_id = fe.guild_id AND g.id = s.guild_id',
+    'processServerFeeds(db, guild_id, server_id)',
     'WHERE guild_id = ? AND server_id = ?',
     'claimPendingEvents(db, guildId, serverId, 50, enabledFeedTypes)',
     'getTemplate(db, event.server_id, event.feed_type, event.event_type)',
@@ -3301,7 +3312,7 @@ async function testFeedWorkerUsesDiscordGuildNamespaceForQueuedEvents() {
   let queueLookup = null;
   const db = {
     async query(sql) {
-      if (sql.includes('SELECT DISTINCT guild_id, server_id FROM feed_events')) {
+      if (sql.includes('SELECT DISTINCT fe.guild_id, fe.server_id')) {
         queueLookup = sql.replace(/\s+/g, ' ');
         return [{ guild_id: discordGuildId, server_id: 42 }];
       }
@@ -3351,7 +3362,7 @@ async function testFeedWorkerDoesNotRouteFactionEventsToKillFeed() {
   let pendingRead = null;
   const db = {
     async query(sql, params) {
-      if (sql.includes('SELECT DISTINCT guild_id, server_id FROM feed_events')) {
+      if (sql.includes('SELECT DISTINCT fe.guild_id, fe.server_id')) {
         return [{ guild_id: discordGuildId, server_id: 42 }];
       }
       if (sql.includes('SELECT * FROM feed_events')) {

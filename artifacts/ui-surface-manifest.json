@@ -480,7 +480,7 @@
       "declaredMiddleware": [
         "apiLimiter",
         "ensureAuthenticated",
-        "ensureHasServers"
+        "ensureHasModeratableServers"
       ],
       "inheritedMiddleware": []
     },
@@ -654,7 +654,7 @@
       "declaredMiddleware": [
         "apiLimiter",
         "ensureAuthenticated",
-        "ensureHasServers"
+        "ensureHasModeratableServers"
       ],
       "inheritedMiddleware": []
     },
@@ -1087,6 +1087,7 @@
       "scripts": [
         "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js",
         "/js/instance-config.js",
+        "/js/serverStatsState.js",
         "/js/serverStats.js"
       ]
     },
@@ -1099,6 +1100,7 @@
         "/js/instance-config.js",
         "/js/api.js",
         "/js/csrf-helper.js",
+        "/js/dayz-time.js",
         "/js/nitrado-settings.js"
       ]
     },
@@ -1239,6 +1241,7 @@
         "/js/instance-config.js",
         "/js/api.js",
         "/js/csrf-helper.js",
+        "/js/mission-doctor.js",
         "/js/mission-editor.js"
       ]
     },
@@ -1249,6 +1252,7 @@
         "/js/instance-config.js",
         "/js/api.js",
         "/js/csrf-helper.js",
+        "/js/dayz-time.js",
         "/js/nitrado-settings.js"
       ]
     },
@@ -2258,7 +2262,7 @@
       "script": "public/js/map.js",
       "transport": "fetch",
       "method": "GET",
-      "target": "/api/guilds/{dynamic}/servers",
+      "target": "/api/guilds/{dynamic}/servers?scope=moderate",
       "targetKind": "template"
     },
     {
@@ -2266,6 +2270,13 @@
       "transport": "fetch",
       "method": "GET",
       "target": "/api/loot/heatmap?{dynamic}",
+      "targetKind": "template"
+    },
+    {
+      "script": "public/js/map.js",
+      "transport": "fetch",
+      "method": "GET",
+      "target": "/api/operations-map/{dynamic}?{dynamic}",
       "targetKind": "template"
     },
     {
@@ -2286,7 +2297,7 @@
       "script": "public/js/map.js",
       "transport": "fetch",
       "method": "GET",
-      "target": "/api/user/guilds",
+      "target": "/api/user/moderatable-guilds",
       "targetKind": "literal"
     },
     {
@@ -2658,6 +2669,13 @@
       "transport": "fetch",
       "method": "GET",
       "target": "/api/stats/{dynamic}?hours={dynamic}",
+      "targetKind": "template"
+    },
+    {
+      "script": "public/js/serverStats.js",
+      "transport": "fetch",
+      "method": "GET",
+      "target": "/api/stats/{dynamic}/overview",
       "targetKind": "template"
     },
     {

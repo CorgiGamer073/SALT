@@ -30,6 +30,13 @@ const {
   scheduledLogSyncDue,
   selectServerIdsToParse,
 } = require('./utils/logSyncScheduling');
+const { acquireExactServerLogLocks } = require('./utils/logIngestionLock');
+const {
+  PIPELINES,
+  beginPipelineRun,
+  buildFullSyncPipelineOutcome,
+  finishPipelineRun,
+} = require('./services/pipelineStatusService');
 
 function startScheduler(db) {
   console.log('\n🚀 Starting automation scheduler...');
@@ -165,19 +172,60 @@ function startScheduler(db) {
             const serverByPlatformId = new Map(
               authorizedServers.map(server => [server.platformServerId, server])
             );
+            const platformIdByInternalId = new Map(
+              authorizedServers.map(server => [Number(server.id), String(server.platformServerId)])
+            );
+            let pipelineRuns = [];
+            let pipelineRunsCompleted = false;
+            const finishPipelineRuns = async outcomeForRun => {
+              if (pipelineRunsCompleted || pipelineRuns.length === 0) return;
+              pipelineRunsCompleted = true;
+              await Promise.all(pipelineRuns.map(run => {
+                const outcome = outcomeForRun(run);
+                return finishPipelineRun(db, run, outcome).catch(statusError => {
+                  console.error(`   ❌ Failed to record log-sync completion for server ${run.serverId}:`, statusError.message);
+                });
+              }));
+            };
 
-            // Every configured server must resolve through the same exact
-            // authorized provider token before the grouped sync can run.
-            const token = await getDecryptedToken(db, row.id, serverIds);
+            const ingestionLock = await acquireExactServerLogLocks(
+              db,
+              authorizedServers.map(server => server.id)
+            );
+            if (!ingestionLock) {
+              console.log('   ⏳ Exact server log ingestion is already active; scheduled sync remains retryable');
+              continue;
+            }
+            try {
+              // Every configured server must resolve through the same exact
+              // authorized provider token before the grouped sync can run.
+              const token = await getDecryptedToken(db, row.id, serverIds);
             if (!token) {
               console.log(`   ⚠️  No unique authorized token found for this sync configuration`);
               continue;
             }
 
+            pipelineRuns = (await Promise.all(authorizedServers.map(async server => {
+              try {
+                return await beginPipelineRun(db, {
+                  serverId: server.id,
+                  pipeline: PIPELINES.FULL_LOG_SYNC,
+                  intervalSeconds: interval * 60,
+                });
+              } catch (statusError) {
+                console.error(`   ❌ Failed to record log-sync start for server ${server.id}:`, statusError.message);
+                return null;
+              }
+            }))).filter(Boolean);
+
             // The finality watermark must never advance past events that could
             // have occurred while the provider download itself was in flight.
             const syncStartedAt = await captureDatabaseClock(db);
-            const result = await performLogSync(db, row.id, token, serverIds);
+            const result = await performLogSync(db, row.id, token, serverIds, {
+              respectAvailabilityBackoff: true,
+            });
+            const pipelineFailedServerIds = new Set((result.failedServerIds || []).map(String));
+            const parsedPipelineServerIds = new Set();
 
             console.log(`   ✅ Complete: ${result.totalFilesDownloaded} new, ${result.totalFilesUpdated} updated`);
 
@@ -207,9 +255,11 @@ function startScheduler(db) {
                     sourceObservedAt: evidence?.latestAdmModifiedAt,
                     sourceObservedLogFile: evidence?.latestAdmPath,
                     includeRptLogs: !rptBlockedServerIds.has(String(serverId)),
+                    ingestionLockHeld: true,
                   });
                   if (!scanResult) {
                     parseErrors.push(`Server ${serverId}: No logs were parsed`);
+                    pipelineFailedServerIds.add(String(serverId));
                     continue;
                   }
                   await markServerLogParseSuccessful(
@@ -219,9 +269,11 @@ function startScheduler(db) {
                     { lifecycleEvidenceReady: scanResult.onlineCachePublished === true }
                   );
                   parsedServers++;
+                  parsedPipelineServerIds.add(String(serverId));
                   console.log(`   ✅ Parsed server ${serverId}: ${scanResult.players} players, ${scanResult.killEvents} kills`);
                 } catch (parseErr) {
                   parseErrors.push(`Server ${serverId}: ${parseErr.message}`);
+                  pipelineFailedServerIds.add(String(serverId));
                   console.error(`   ❌ Error parsing logs for server ${serverId}:`, parseErr.message);
                 }
               }
@@ -247,8 +299,10 @@ function startScheduler(db) {
                   syncStartedAt,
                   { lifecycleEvidenceReady }
                 );
+                parsedPipelineServerIds.add(String(serverId));
               } catch (parseErr) {
                 parseErrors.push(`Server ${serverId}: ${parseErr.message}`);
+                pipelineFailedServerIds.add(String(serverId));
               }
             }
 
@@ -266,10 +320,17 @@ function startScheduler(db) {
                 }, evidence);
               } catch (restartErr) {
                 parseErrors.push(`Server ${platformServerId} restart evidence: ${restartErr.message}`);
+                pipelineFailedServerIds.add(String(platformServerId));
                 console.error(`   ❌ Error processing restart events for server ${platformServerId}:`, restartErr.message);
               }
             }
 
+            const exactOutcomeForRun = (run, forcedErrorCode = null) => buildFullSyncPipelineOutcome({
+              platformServerId: platformIdByInternalId.get(Number(run.serverId)),
+              failedServerIds: pipelineFailedServerIds,
+              parsedServerIds: parsedPipelineServerIds,
+              forcedErrorCode,
+            });
             const runSuccessful = isLogSyncRunSuccessful({
               syncErrors: result.errors,
               parseErrors,
@@ -278,6 +339,7 @@ function startScheduler(db) {
             });
             if (!runSuccessful) {
               console.error('   ❌ Sync run incomplete; lastRun preserved so it remains retryable');
+              await finishPipelineRuns(run => exactOutcomeForRun(run));
               continue;
             }
 
@@ -290,6 +352,19 @@ function startScheduler(db) {
               );
             } catch (updateErr) {
               console.error('   ❌ Failed to update lastRun:', updateErr.message);
+              await finishPipelineRuns(run => exactOutcomeForRun(run, 'SYNC_STATE_PERSIST_FAILED'));
+              continue;
+            }
+            await finishPipelineRuns(run => exactOutcomeForRun(run));
+            } finally {
+              await finishPipelineRuns(() => ({
+                status: 'failed',
+                errorCode: 'SYNC_RUN_FAILED',
+                counters: {},
+              }));
+              await ingestionLock.release().catch(lockErr => {
+                console.error('   ❌ Failed to release exact-server log ingestion lock:', lockErr.message);
+              });
             }
 
           } else {

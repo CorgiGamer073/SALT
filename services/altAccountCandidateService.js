@@ -3,6 +3,8 @@ const { isTrustedLinkMethod } = require('../utils/linkTrust');
 const REVIEW_STATUSES = new Set(['pending', 'confirmed', 'dismissed']);
 const RAPID_SWITCH_SECONDS = 300;
 const LIKELY_SWITCH_SECONDS = 120;
+const ENFORCED_RPT_WAIT_MS = 60000;
+const CONFIDENCE_RANK = { possible: 0, likely: 1, confirmed: 2 };
 
 function pairKey(a, b) {
   const low = Math.min(Number(a), Number(b));
@@ -85,32 +87,67 @@ function firstSessionAfter(sessions, timestampMs) {
   return low;
 }
 
+function distinctDaysLabel(count) {
+  return Number(count) >= 2
+    ? 'Handoffs occurred on separate days'
+    : 'Handoffs observed on one day';
+}
+
+function formatWaitDuration(durationMs) {
+  const totalSeconds = Math.max(0, Math.floor(Number(durationMs) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
 function behaviorEvidenceFromAggregate(row) {
   const eventCount = Number(row.event_count);
   const strictCount = Number(row.strict_count);
   const distinctDays = Number(row.distinct_days);
-  return [
+  const waitCount = Number(row.enforced_wait_count || 0);
+  const evidence = [
     {
       type: 'rapid_switches',
-      label: `Repeated account handoffs within ${RAPID_SWITCH_SECONDS / 60} minutes`,
+      label: eventCount === 1
+        ? `Account handoff within ${RAPID_SWITCH_SECONDS / 60} minutes`
+        : `Repeated account handoffs within ${RAPID_SWITCH_SECONDS / 60} minutes`,
       count: eventCount,
       strictCount,
       minimumDelaySeconds: Number(row.minimum_delay_seconds),
     },
     {
       type: 'distinct_days',
-      label: 'Handoffs occurred on separate days',
+      label: distinctDaysLabel(distinctDays),
       count: distinctDays,
     },
-    {
+  ];
+  if (Number(row.strict_direction_count) >= 2) {
+    evidence.push({
       type: 'bidirectional_switches',
       label: 'Handoffs occurred in both directions',
-    },
-    {
+    });
+  }
+  if (waitCount === 0) {
+    evidence.push({
       type: 'never_concurrent',
       label: 'No overlapping completed sessions were observed',
-    },
-  ];
+    });
+  }
+  const minimumWaitMs = Number(row.minimum_wait_duration_ms);
+  const maximumWaitMs = Number(row.maximum_wait_duration_ms);
+  if (waitCount > 0 && Number.isFinite(minimumWaitMs) && Number.isFinite(maximumWaitMs)) {
+    const range = minimumWaitMs === maximumWaitMs
+      ? formatWaitDuration(minimumWaitMs)
+      : `${formatWaitDuration(minimumWaitMs)}–${formatWaitDuration(maximumWaitMs)}`;
+    evidence.push({
+      type: 'rpt_login_wait',
+      label: `RPT login-state waits observed: ${range}`,
+      count: waitCount,
+      minimumWaitSeconds: minimumWaitMs / 1000,
+      maximumWaitSeconds: maximumWaitMs / 1000,
+    });
+  }
+  return evidence;
 }
 
 function buildAltCandidates({ accounts = [], sessions = [], reviews = [], behaviorCandidates = [] }) {
@@ -173,22 +210,26 @@ function buildAltCandidates({ accounts = [], sessions = [], reviews = [], behavi
           firstId: Math.min(ending.identity_id, starting.identity_id),
           secondId: Math.max(ending.identity_id, starting.identity_id),
           events: [],
-          directions: new Set(),
           days: new Set(),
         });
       }
       const transition = transitions.get(key);
-      transition.events.push({ delaySeconds, at: ending.logout_at });
-      transition.directions.add(`${ending.identity_id}>${starting.identity_id}`);
+      transition.events.push({
+        delaySeconds,
+        at: ending.logout_at,
+        direction: `${ending.identity_id}>${starting.identity_id}`,
+      });
       transition.days.add(new Date(logoutMs).toISOString().slice(0, 10));
+      break;
     }
   }
 
   for (const transition of transitions.values()) {
-    if (transition.events.length < 3 || transition.days.size < 2 || transition.directions.size < 2) continue;
+    const strictEvents = transition.events.filter(event => event.delaySeconds <= LIKELY_SWITCH_SECONDS);
+    const strictDirections = new Set(strictEvents.map(event => event.direction));
+    if (strictEvents.length < 2 || strictDirections.size < 2) continue;
     if (pairWasConcurrent(sessionsByIdentity, transition.firstId, transition.secondId)) continue;
 
-    const strictEvents = transition.events.filter(event => event.delaySeconds <= LIKELY_SWITCH_SECONDS);
     const strictSwitches = strictEvents.length;
     const strictDays = new Set(strictEvents.map(event => String(event.at).slice(0, 10)));
     const confidence = strictSwitches >= 3 && strictDays.size >= 2 ? 'likely' : 'possible';
@@ -203,7 +244,7 @@ function buildAltCandidates({ accounts = [], sessions = [], reviews = [], behavi
       },
       {
         type: 'distinct_days',
-        label: 'Handoffs occurred on separate days',
+        label: distinctDaysLabel(transition.days.size),
         count: transition.days.size,
       },
       {
@@ -236,12 +277,28 @@ function buildAltCandidates({ accounts = [], sessions = [], reviews = [], behavi
     const secondId = Number(row.identity_id_high);
     if (!accountsById.has(firstId) || !accountsById.has(secondId)) continue;
     const strictDays = Number(row.strict_distinct_days);
-    const confidence = Number(row.strict_count) >= 3 && strictDays >= 2 ? 'likely' : 'possible';
+    const hasEnforcedRPTWait = Number(row.enforced_wait_count || 0) > 0;
+    const confidence = hasEnforcedRPTWait
+      ? 'confirmed'
+      : (Number(row.strict_count) >= 3 && strictDays >= 2 ? 'likely' : 'possible');
     const evidence = behaviorEvidenceFromAggregate(row);
     const key = pairKey(firstId, secondId);
     const existing = candidates.get(key);
-    if (existing) existing.evidence.push(...evidence);
-    else candidates.set(key, createCandidate(accountsById, firstId, secondId, confidence, evidence, reviewMap));
+    if (existing) {
+      existing.evidence.push(...evidence);
+      if (CONFIDENCE_RANK[confidence] > CONFIDENCE_RANK[existing.confidence]) {
+        existing.confidence = confidence;
+      }
+    } else {
+      candidates.set(key, createCandidate(
+        accountsById,
+        firstId,
+        secondId,
+        confidence,
+        evidence,
+        reviewMap
+      ));
+    }
   }
 
   for (const review of reviews) {
@@ -311,23 +368,35 @@ async function loadAltCandidates(db, serverId) {
           GREATEST(ending.identity_id, starting.identity_id) AS identity_id_high,
           EXTRACT(EPOCH FROM (starting.login_at - ending.logout_at)) AS delay_seconds,
           (ending.logout_at AT TIME ZONE 'UTC')::date AS transition_day,
-          ending.identity_id::text || '>' || starting.identity_id::text AS direction
-        FROM player_sessions ending
-        JOIN servers s ON s.id = ending.server_id AND s.status = 'active'
+          ending.identity_id::text || '>' || starting.identity_id::text AS direction,
+          login_wait.wait_duration_ms AS login_wait_duration_ms
+        FROM player_sessions starting
+        JOIN servers s ON s.id = starting.server_id AND s.status = 'active'
         JOIN guilds g ON g.id = s.guild_id AND g.status = 'approved'
         JOIN LATERAL (
-          SELECT candidate.identity_id, candidate.login_at
-          FROM player_sessions candidate
-          WHERE candidate.server_id = ending.server_id
-            AND candidate.logout_at IS NOT NULL
-            AND candidate.login_at > ending.logout_at
-            AND candidate.login_at <= ending.logout_at + INTERVAL '5 minutes'
-            AND candidate.identity_id <> ending.identity_id
-          ORDER BY candidate.login_at
-        ) starting ON TRUE
-        WHERE ending.server_id = ?
-          AND ending.logout_at IS NOT NULL
-          AND ending.login_at >= NOW() - INTERVAL '90 days'
+          SELECT ending.identity_id, ending.logout_at
+          FROM player_sessions ending
+          WHERE ending.server_id = starting.server_id
+            AND ending.logout_at IS NOT NULL
+            AND ending.logout_at < starting.login_at
+            AND ending.logout_at >= starting.login_at - INTERVAL '5 minutes'
+            AND ending.identity_id <> starting.identity_id
+          ORDER BY ending.logout_at DESC
+          LIMIT 1
+        ) ending ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT login_wait.wait_duration_ms
+          FROM rpt_login_wait_events login_wait
+          WHERE login_wait.server_id = starting.server_id
+            AND login_wait.identity_id = starting.identity_id
+            AND login_wait.wait_duration_ms >= ${ENFORCED_RPT_WAIT_MS}
+            AND login_wait.queue_entered_at BETWEEN starting.login_at - INTERVAL '5 seconds'
+                                                AND starting.login_at + INTERVAL '5 seconds'
+          ORDER BY ABS(EXTRACT(EPOCH FROM (login_wait.queue_entered_at - starting.login_at)))
+          LIMIT 1
+        ) login_wait ON TRUE
+        WHERE starting.server_id = ?
+          AND starting.login_at >= NOW() - INTERVAL '90 days'
       ), aggregated AS (
         SELECT
           identity_id_low,
@@ -337,29 +406,51 @@ async function loadAltCandidates(db, serverId) {
           COUNT(DISTINCT transition_day) AS distinct_days,
           COUNT(DISTINCT transition_day) FILTER (WHERE delay_seconds <= 120) AS strict_distinct_days,
           COUNT(DISTINCT direction) AS direction_count,
-          MIN(delay_seconds) AS minimum_delay_seconds
+          COUNT(DISTINCT direction) FILTER (WHERE delay_seconds <= 120) AS strict_direction_count,
+          MIN(delay_seconds) AS minimum_delay_seconds,
+          COUNT(login_wait_duration_ms) AS enforced_wait_count,
+          MIN(login_wait_duration_ms) AS minimum_wait_duration_ms,
+          MAX(login_wait_duration_ms) AS maximum_wait_duration_ms
         FROM transitions
         GROUP BY identity_id_low, identity_id_high
-        HAVING COUNT(*) >= 3
-           AND COUNT(DISTINCT transition_day) >= 2
-           AND COUNT(DISTINCT direction) >= 2
+        HAVING COUNT(login_wait_duration_ms) >= 1
+            OR (
+              COUNT(*) FILTER (WHERE delay_seconds <= 120) >= 2
+              AND COUNT(DISTINCT direction) FILTER (WHERE delay_seconds <= 120) >= 2
+            )
       )
       SELECT aggregated.*
       FROM aggregated
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM player_sessions older
-        JOIN player_sessions newer
-          ON newer.server_id = older.server_id
-         AND newer.identity_id = aggregated.identity_id_high
-         AND newer.logout_at IS NOT NULL
-         AND tstzrange(newer.login_at, newer.logout_at, '[)')
-             && tstzrange(older.login_at, older.logout_at, '[)')
-        WHERE older.server_id = ?
-          AND older.identity_id = aggregated.identity_id_low
-          AND older.logout_at IS NOT NULL
+      WHERE (
+        aggregated.enforced_wait_count >= 1
+        OR NOT EXISTS (
+          SELECT 1
+          FROM player_sessions older
+          JOIN player_sessions newer
+            ON newer.server_id = older.server_id
+           AND newer.identity_id = aggregated.identity_id_high
+           AND newer.logout_at IS NOT NULL
+           AND tstzrange(newer.login_at, newer.logout_at, '[)')
+               && tstzrange(older.login_at, older.logout_at, '[)')
+          WHERE older.server_id = ?
+            AND older.identity_id = aggregated.identity_id_low
+            AND older.logout_at IS NOT NULL
+        )
       )
-    `, [serverId, serverId]),
+      AND (
+        aggregated.enforced_wait_count >= 1
+        OR NOT EXISTS (
+          SELECT 1
+          FROM player_position_snapshots first_sighting
+          JOIN player_position_snapshots second_sighting
+            ON second_sighting.server_id = first_sighting.server_id
+           AND second_sighting.identity_id = aggregated.identity_id_high
+           AND second_sighting.timestamp = first_sighting.timestamp
+          WHERE first_sighting.server_id = ?
+            AND first_sighting.identity_id = aggregated.identity_id_low
+        )
+      )
+    `, [serverId, serverId, serverId]),
     db.query(`
       SELECT aar.identity_id_low, aar.identity_id_high, aar.status,
              aar.notes, aar.reviewed_at, aar.reviewed_by

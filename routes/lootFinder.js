@@ -263,8 +263,8 @@ router.get('/heatmap', ensureAuthenticated, ensurePlatformServerOwner, async (re
     // Grid-aggregate: group positions into cells, return cell centre + count
     const pointsRes = await db.query(
       `SELECT
-         ROUND(pos_x / $3) * $3 + $3 / 2.0 AS cx,
-         ROUND(pos_z / $3) * $3 + $3 / 2.0 AS cz,
+         FLOOR(pos_x / $3) * $3 + $3 / 2.0 AS cx,
+         FLOOR(pos_z / $3) * $3 + $3 / 2.0 AS cz,
          COUNT(*)::int                       AS cnt
        FROM loot_despawn_events
        WHERE server_id = $1

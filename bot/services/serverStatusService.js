@@ -21,6 +21,7 @@ const ftp = require('basic-ftp');
 const pool = require('../db');
 const { decryptToken } = require('../../utils/encryption');
 const { detectDayzPlatform, platformDataDirectory } = require('../../utils/dayzPlatform');
+const { estimate: estimateDayZTime } = require('../../public/js/dayz-time');
 
 const { toNitradoFtpPath } = require('../utils/nitrado');
 const { createNitradoService } = require('../../services/nitradoService');
@@ -121,20 +122,6 @@ async function applyChangedOnlineCacheRows(previousGenerations, rows, updateRow,
     }
   }
 }
-
-// DayZ day/night duration formula (Bohemia Interactive wiki):
-//   realDayHrs   = DAY_HOURS / serverTimeAcceleration
-//   realNightHrs = NIGHT_HOURS / (serverTimeAcceleration × serverNightTimeAcceleration)
-//
-// serverNightTimeAcceleration stacks ON TOP of serverTimeAcceleration during night —
-// the wiki calls the combined value the "effective" night speed.
-// e.g. dayMult=2, nightMult=4 → effective night = 8× faster.
-//
-// The 12/12 split is DayZ's approximate default; actual hours vary by in-game season.
-// Estimates shown in the embed should be treated as approximations.
-// Ref: https://community.bistudio.com/wiki/DayZ:Server_Configuration
-const DAY_HOURS = 12;
-const NIGHT_HOURS = 12;
 
 // Tracks whether an update cycle is already running to prevent overlap.
 let updateRunning = false;
@@ -393,6 +380,73 @@ function getServerStartTimeFromLogs(guildDiscordId, platformServerId) {
   }
 }
 
+function parseShutdownFromLogTail(tail, serverStartMs) {
+  if (typeof tail !== 'string' || !Number.isFinite(serverStartMs)) return null;
+
+  const lines = tail.split('\n');
+  const biosPattern = /^\s*(\d{1,2}):(\d{2}):(\d{2})\s+.*Connected to BIOS/;
+  let sessionStart = -1;
+  let biosMatch = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const candidate = lines[i].match(biosPattern);
+    if (candidate) {
+      sessionStart = i;
+      biosMatch = candidate;
+      break;
+    }
+  }
+  if (sessionStart < 0) return null;
+
+  const biosHour = Number(biosMatch[1]);
+  const biosMinute = Number(biosMatch[2]);
+  const biosSecond = Number(biosMatch[3]);
+  if (biosHour > 23 || biosMinute > 59 || biosSecond > 59) return null;
+
+  const startDate = new Date(serverStartMs);
+  const startDayMs = Date.UTC(
+    startDate.getUTCFullYear(),
+    startDate.getUTCMonth(),
+    startDate.getUTCDate()
+  );
+  const biosTimeOfDayMs = ((biosHour * 60 + biosMinute) * 60 + biosSecond) * 1000;
+  const biosCandidates = [-1, 0, 1].map(dayOffset =>
+    startDayMs + dayOffset * 24 * 60 * 60 * 1000 + biosTimeOfDayMs
+  );
+  const biosEpochMs = biosCandidates.reduce((closest, candidate) =>
+    Math.abs(candidate - serverStartMs) < Math.abs(closest - serverStartMs) ? candidate : closest
+  );
+  if (Math.abs(biosEpochMs - serverStartMs) > 30 * 60 * 1000) return null;
+
+  const shutdownPattern = /^\s*(\d{1,2}):(\d{2}):(\d{2})\s+\[Shutdown\]\s+Shutting down in (\d+) seconds/;
+  let match = null;
+  for (let i = sessionStart; i < lines.length; i++) {
+    const candidate = lines[i].match(shutdownPattern);
+    if (candidate) match = candidate;
+  }
+  if (!match) return null;
+
+  const logHour = Number(match[1]);
+  const logMinute = Number(match[2]);
+  const logSecond = Number(match[3]);
+  const remainingSeconds = Number(match[4]);
+  if (logHour > 23 || logMinute > 59 || logSecond > 59 || !Number.isSafeInteger(remainingSeconds)) {
+    return null;
+  }
+
+  const biosDate = new Date(biosEpochMs);
+  let lineEpochMs = Date.UTC(
+    biosDate.getUTCFullYear(),
+    biosDate.getUTCMonth(),
+    biosDate.getUTCDate(),
+    logHour,
+    logMinute,
+    logSecond
+  );
+  if (lineEpochMs < biosEpochMs) lineEpochMs += 24 * 60 * 60 * 1000;
+  if (lineEpochMs < serverStartMs) return null;
+  return lineEpochMs + remainingSeconds * 1000;
+}
+
 /**
  * Tails the last `tailBytes` of `server.log` via FTP and searches for the
  * most recent `[Shutdown] Shutting down in X seconds` line belonging to the
@@ -450,57 +504,10 @@ async function parseShutdownFromFtp(ftpCreds, serverStartMs, platform, game) {
     });
     await client.downloadTo(sink, SERVER_LOG, startByte);
     const tail = Buffer.concat(chunks).toString('utf8');
+    const shutdownAtMs = parseShutdownFromLogTail(tail, serverStartMs);
+    if (shutdownAtMs === null) return null;
 
-    // Split into lines and find the last "Connected to BIOS" marker (start of
-    // the current session) then look for [Shutdown] lines after it.
-    const lines = tail.split('\n');
-    let sessionStart = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].includes('Connected to BIOS')) { sessionStart = i; break; }
-    }
-    // Search for [Shutdown] lines in current session (or full tail if no BIOS line found)
-    const searchFrom = sessionStart >= 0 ? sessionStart : 0;
-
-    const SHUTDOWN_RE = /^\s*(\d+:\d{2}:\d{2})\s+\[Shutdown\]\s+Shutting down in (\d+) seconds/;
-    let lastShutdownLine = null;
-    for (let i = searchFrom; i < lines.length; i++) {
-      if (SHUTDOWN_RE.test(lines[i])) lastShutdownLine = lines[i];
-    }
-
-    if (!lastShutdownLine) return null;
-
-    const m = lastShutdownLine.match(SHUTDOWN_RE);
-    const [hStr, minStr, secStr] = m[1].split(':');
-    const remainingSecs = parseInt(m[2], 10);
-
-    // Convert HH:MM:SS to ms-since-epoch using serverStartMs as the date anchor.
-    // The log resets the day counter on server start, so we use the server-start date.
-    const startDate = new Date(serverStartMs);
-    const logH   = parseInt(hStr,   10);
-    const logMin = parseInt(minStr, 10);
-    const logS   = parseInt(secStr, 10);
-
-    // Build the log-line timestamp (UTC).
-    let lineEpochMs = Date.UTC(
-      startDate.getUTCFullYear(),
-      startDate.getUTCMonth(),
-      startDate.getUTCDate(),
-      logH, logMin, logS
-    );
-
-    // Handle midnight rollover: if the computed timestamp is before serverStartMs,
-    // the line belongs to the next calendar day.
-    if (lineEpochMs < serverStartMs) lineEpochMs += 24 * 60 * 60 * 1000;
-
-    // Reject [Shutdown] lines that predate the current server boot — these belong
-    // to a previous session that's still in the tail because no BIOS line was found.
-    if (lineEpochMs < serverStartMs) {
-      console.log(`ℹ️  parseShutdownFromFtp: [Shutdown] line (${m[1]}) predates current boot — ignoring (previous session)`);
-      return null;
-    }
-
-    const shutdownAtMs = lineEpochMs + remainingSecs * 1000;
-    console.log(`✅ parseShutdownFromFtp: last [Shutdown] line="${m[1]}", remaining=${remainingSecs}s → shutdown at ${new Date(shutdownAtMs).toISOString()}`);
+    console.log(`✅ parseShutdownFromFtp: current-session [Shutdown] evidence predicts ${new Date(shutdownAtMs).toISOString()}`);
     return shutdownAtMs;
 
   } catch (err) {
@@ -675,35 +682,96 @@ function flag(value, invertLogic = false) {
   return enabled ? '✅' : '❌';
 }
 
+function providerStatusChangeMs(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const normalizedValue = typeof value === 'string' ? value.trim() : value;
+  const numeric = typeof normalizedValue === 'number'
+    ? normalizedValue
+    : (/^\d+$/.test(normalizedValue) ? Number(normalizedValue) : null);
+  const parsed = numeric !== null
+    ? (numeric < 1e12 ? numeric * 1000 : numeric)
+    : Date.parse(normalizedValue);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > Date.now() + 5 * 60 * 1000) return null;
+  return parsed;
+}
+
+const MISSING_PLAYER_EVIDENCE_WARNING_INTERVAL_MS = 15 * 60 * 1000;
+const MISSING_PLAYER_EVIDENCE_RETENTION_MS = 2 * 60 * 60 * 1000;
+const missingPlayerEvidenceWarnings = new Map();
+
+function logMissingOnlinePlayerEvidence(serverDbId, livePlayerCount, {
+  logger = console,
+  nowMs = Date.now(),
+} = {}) {
+  for (const [serverKey, warnedAt] of missingPlayerEvidenceWarnings) {
+    if (nowMs - warnedAt > MISSING_PLAYER_EVIDENCE_RETENTION_MS) {
+      missingPlayerEvidenceWarnings.delete(serverKey);
+    }
+  }
+  const key = String(serverDbId);
+  if (!Number.isInteger(livePlayerCount) || livePlayerCount <= 0) {
+    missingPlayerEvidenceWarnings.delete(key);
+    return false;
+  }
+  const lastWarningAt = missingPlayerEvidenceWarnings.get(key);
+  if (Number.isFinite(lastWarningAt)
+      && nowMs - lastWarningAt < MISSING_PLAYER_EVIDENCE_WARNING_INTERVAL_MS) return false;
+  missingPlayerEvidenceWarnings.set(key, nowMs);
+  logger.log(`⚠️  fetchOnlinePlayers(server_db_id=${serverDbId}): provider reports ${livePlayerCount} player(s), but current exact-server log evidence is unavailable`);
+  return true;
+}
+
 /**
  * Fetches currently online players from the server_online_cache table.
  * This cache is written by the log scanner at the end of each ADM log scan,
  * reflecting only players who were connected at the end of the most recent log.
  * Returns an array of { gamertag, login_at, updated_at } objects.
  */
-async function fetchOnlinePlayers(serverDbId, platformServerId = null) {
+async function fetchOnlinePlayers(
+  serverDbId,
+  platformServerId = null,
+  livePlayerCount = null,
+  serverStartedAtMs = null,
+  queryPool = pool
+) {
   try {
-    const res = await pool.query(
-      `SELECT cache.gamertag, cache.login_at, cache.updated_at
+    const reportedPlayerCount = Number.isInteger(livePlayerCount) && livePlayerCount > 0
+      ? livePlayerCount
+      : 0;
+    if (Number.isInteger(livePlayerCount) && livePlayerCount <= 0) {
+      missingPlayerEvidenceWarnings.delete(String(serverDbId));
+      return [];
+    }
+    if (!Number.isFinite(serverStartedAtMs)) {
+      logMissingOnlinePlayerEvidence(serverDbId, reportedPlayerCount);
+      return [];
+    }
+    const serverStartedAt = new Date(serverStartedAtMs);
+    const res = await queryPool.query(
+      `SELECT cache.gamertag, cache.login_at, cache.updated_at,
+              snapshot.source_observed_at AS last_seen_at,
+              'authoritative'::text AS evidence_kind
        FROM server_online_cache cache
        JOIN server_online_cache_snapshots snapshot
          ON snapshot.server_id = cache.server_id
        WHERE cache.server_id = $1
+         AND ($2::timestamptz IS NULL OR cache.login_at >= $2)
+         AND ($2::timestamptz IS NULL OR snapshot.source_observed_at >= $2)
          AND snapshot.source_observed_at >= clock_timestamp() - INTERVAL '120 minutes'
          AND snapshot.source_observed_at <= clock_timestamp() + INTERVAL '5 minutes'
        ORDER BY cache.login_at ASC`,
-      [serverDbId]
+      [serverDbId, serverStartedAt]
     );
 
-    const count = res.rows.length;
-    if (count > 0) {
+    if (res.rows.length === reportedPlayerCount && res.rows.length > 0) {
+      missingPlayerEvidenceWarnings.delete(String(serverDbId));
       const lastUpdate = res.rows[0].updated_at;
-      console.log(`✅ fetchOnlinePlayers(server_db_id=${serverDbId}): found ${count} player(s), last cache update: ${lastUpdate}`);
-    } else {
-      console.log(`⚠️  fetchOnlinePlayers(server_db_id=${serverDbId}): no player names backed by fresh log evidence`);
+      console.log(`✅ fetchOnlinePlayers(server_db_id=${serverDbId}): found ${res.rows.length} exact-server log-backed player(s), last cache update: ${lastUpdate}`);
+      return res.rows;
     }
 
-    return res.rows;
+    logMissingOnlinePlayerEvidence(serverDbId, reportedPlayerCount);
+    return [];
   } catch (err) {
     console.error(`❌ fetchOnlinePlayers(server_db_id=${serverDbId}) error:`, err.message);
     return [];
@@ -720,11 +788,15 @@ function buildEmbed(serverName, gameserver, restartLabel, onlinePlayers = [], la
   const cfg = gameserver.settings?.config || {};
   const status = gameserver.status === 'started' ? 'Online' : 'Offline';
 
-  const dayMult = parseFloat(cfg.serverTimeAcceleration) || 1;
-  const nightMult = parseFloat(cfg.serverNightTimeAcceleration) || 1;
-  const nightEffective = dayMult * nightMult;
-  const realDayHrs = (DAY_HOURS / dayMult).toFixed(1);
-  const realNightHrs = (NIGHT_HOURS / nightEffective).toFixed(1);
+  const timeEstimate = estimateDayZTime(cfg.serverTimeAcceleration, cfg.serverNightTimeAcceleration);
+  const timeSettings = timeEstimate ? [
+    ` Day Speed　　　　${Number(cfg.serverTimeAcceleration)}× (~${timeEstimate.dayHours.toFixed(1)} hrs)`,
+    ` Night Speed　　　${timeEstimate.effectiveNightMultiplier}× eff. (~${timeEstimate.nightHours.toFixed(1)} hrs)`,
+    `　　${Number(cfg.serverTimeAcceleration)}× day + ${Number(cfg.serverNightTimeAcceleration)}× night stacked — varies by season`,
+  ] : [
+    ' Day Speed　　　　Unknown',
+    ' Night Speed　　　Unknown',
+  ];
 
   // Strip map prefix
   const mapRaw = query.map || '';
@@ -764,7 +836,56 @@ function buildEmbed(serverName, gameserver, restartLabel, onlinePlayers = [], la
     }
   }
 
-  // If we have player names, show them in a clean list format
+  const estimatedPlayers = onlinePlayers.filter(player => player.evidence_kind === 'estimated');
+  if (estimatedPlayers.length > 0) {
+    const candidateList = estimatedPlayers
+      .map(player => {
+        const seenMs = new Date(player.last_seen_at).getTime();
+        const seenLabel = Number.isFinite(seenMs)
+          ? `<t:${Math.floor(seenMs / 1000)}:R>`
+          : 'at an unknown time';
+        return `${player.gamertag} — seen ${seenLabel}`;
+      })
+      .join('\n');
+
+    return new EmbedBuilder()
+      .setColor(0xfee75c)
+      .setTitle(`${serverName}`)
+      .setDescription(`DayZ (Xbox One) • v${version}\n\n⚠️ Estimated names from delayed ADM sightings — these players are not confirmed online.`)
+      .addFields(
+        {
+          name: '\u200B',
+          value: `${status}　　 ${liveCount} / ${playerMax}　　 ${mapDisplay}`,
+          inline: false
+        },
+        {
+          name: '─── Server Settings ───────────────────',
+          value: [
+            ...timeSettings,
+            ` Darker Night　　 ${flag(cfg.lightingConfig)}`,
+            ` Mouse & Keyboard ${flag(cfg.enableMouseAndKeyboard)}`,
+            ` Crosshair　　　　${flag(cfg.disableCrosshair, true)}`,
+            ` Third Person　　 ${flag(cfg.disable3rdPerson, true)}`,
+            ` Whitelist　　　　${flag(cfg.enableWhitelist)}`
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: '─── Next Restart ──────────────────────',
+          value: [restartDisplay, lastRestartLine].filter(Boolean).join('\n'),
+          inline: false
+        },
+        {
+          name: `─── Estimated Players (${estimatedPlayers.length} candidates / ${liveCount} reported) ──`,
+          value: `⚠️ Not confirmed online; based on recent exact-server sightings.\n${candidateList}`.slice(0, 2048),
+          inline: false
+        }
+      )
+      .setFooter({ text: `${footerText} • Estimated list may be incomplete or incorrect` })
+      .setTimestamp();
+  }
+
+  // If we have authoritative player names, show them in a clean list format
   if (cacheCount > 0) {
     const playerList = onlinePlayers
       .map(p => p.gamertag)
@@ -784,9 +905,7 @@ function buildEmbed(serverName, gameserver, restartLabel, onlinePlayers = [], la
         {
           name: '─── Server Settings ───────────────────',
           value: [
-            ` Day Speed　　　　${dayMult}× (~${realDayHrs} hrs)`,
-            ` Night Speed　　　${nightEffective}× eff. (~${realNightHrs} hrs)`,
-            `　　${dayMult}× day + ${nightMult}× night stacked — varies by season`,
+            ...timeSettings,
             ` Darker Night　　 ${flag(cfg.lightingConfig)}`,
             ` Mouse & Keyboard ${flag(cfg.enableMouseAndKeyboard)}`,
             ` Crosshair　　　　${flag(cfg.disableCrosshair, true)}`,
@@ -827,9 +946,7 @@ function buildEmbed(serverName, gameserver, restartLabel, onlinePlayers = [], la
       {
         name: '─── Server Settings ───────────────────',
         value: [
-          ` Day Speed　　　　${dayMult}× (~${realDayHrs} hrs)`,
-          ` Night Speed　　　${nightEffective}× eff. (~${realNightHrs} hrs)`,
-          `　　${dayMult}× day + ${nightMult}× night stacked — varies by season`,
+          ...timeSettings,
           ` Darker Night　　 ${flag(cfg.lightingConfig)}`,
           ` Mouse & Keyboard ${flag(cfg.enableMouseAndKeyboard)}`,
           ` Crosshair　　　　${flag(cfg.disableCrosshair, true)}`,
@@ -849,7 +966,7 @@ function buildEmbed(serverName, gameserver, restartLabel, onlinePlayers = [], la
       {
         name: `─── Online Players (${displayCount}) ────────────`,
         value: liveCount > 0
-          ? `*${liveCount} player${liveCount !== 1 ? 's' : ''} online — names unavailable — provider log evidence is delayed or stale*`
+          ? `*${liveCount} player${liveCount !== 1 ? 's' : ''} online — current log evidence unavailable*`
           : '*No players reported online*',
         inline: false
       }
@@ -1029,7 +1146,12 @@ async function updateGuild(client, guildRow, { updateVoiceChannels = true } = {}
   const serverName = resolveServerName(dbName, gameserver);
 
   // Fetch online player list with debugging
-  const onlinePlayers = await fetchOnlinePlayers(server_db_id, platform_server_id);
+  const onlinePlayers = await fetchOnlinePlayers(
+    server_db_id,
+    platform_server_id,
+    Number.isInteger(gameserver.query?.player_current) ? gameserver.query.player_current : null,
+    providerStatusChangeMs(gameserver.last_status_change)
+  );
 
   // Get sync timing info from automation_settings
   let lastLogSyncTime = null;
@@ -1140,47 +1262,6 @@ async function updateGuild(client, guildRow, { updateVoiceChannels = true } = {}
 }
 
 /**
- * Refreshes only the player-name surface from local database/cache state.
- * Provider status and restart discovery remain on the five-minute full pass.
- */
-async function refreshGuildPresence(client, guildRow, {
-  renderCache = statusRenderCache,
-  fetchPlayers = fetchOnlinePlayers,
-  edit = safeEdit,
-} = {}) {
-  const config = JSON.parse(guildRow.config || '{}');
-  const { text_channel_id, pinned_message_id } = config;
-  const serverDbId = guildRow.server_db_id;
-  if (!text_channel_id || !pinned_message_id || !serverDbId) return false;
-
-  const renderState = renderCache.get(String(serverDbId));
-  if (!renderState) return false;
-
-  try {
-    const onlinePlayers = await fetchPlayers(serverDbId, renderState.platformServerId);
-    const embed = buildEmbed(
-      renderState.serverName,
-      renderState.gameserver,
-      renderState.restartLabel,
-      onlinePlayers,
-      renderState.lastLogSyncTime,
-      renderState.nextLogSyncTime,
-      renderState.restartAtMs
-    );
-    const textChannel = await client.channels.fetch(text_channel_id);
-    if (textChannel?.guildId !== guildRow.discord_guild_id) {
-      throw new Error('Status channel does not belong to the configured Discord guild');
-    }
-    if (!textChannel) return false;
-    const message = await textChannel.messages.fetch(pinned_message_id);
-    return edit(() => message.edit({ embeds: [embed] }));
-  } catch (error) {
-    console.error(`❌ Could not refresh player names for server_db_id ${serverDbId}:`, error.message);
-    return false;
-  }
-}
-
-/**
  * Runs one full update pass across all guilds that have server_status enabled.
  */
 async function runUpdate(client, { updateVoiceChannels = true } = {}) {
@@ -1238,7 +1319,7 @@ async function refreshStatusOnOnlineCacheChange(client) {
     await applyChangedOnlineCacheRows(
       lastOnlineCacheGenerations,
       res.rows,
-      row => refreshGuildPresence(client, row),
+      row => updateGuild(client, row, { updateVoiceChannels: false }),
       (error, row) => console.error(
         `❌ Could not refresh cache generation for server_db_id ${row.server_db_id}:`,
         error.message
@@ -1269,8 +1350,11 @@ module.exports = {
   backfillLegacyNitradoTokenBindings,
   startLoop,
   buildEmbed,
+  fetchOnlinePlayers,
+  logMissingOnlinePlayerEvidence,
+  parseShutdownFromLogTail,
+  providerStatusChangeMs,
   applyChangedOnlineCacheRows,
-  refreshGuildPresence,
   safeEdit,
   selectChangedOnlineCacheRows,
   formatRestartChannelName,

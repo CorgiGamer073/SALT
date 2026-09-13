@@ -30,6 +30,17 @@
     <!-- Settings Container -->
     <div id="settingsContainer" class="hidden">
 
+      <!-- Approximate day/night preview -->
+      <section id="timePreviewCard" class="hidden bg-gray-800 p-6 rounded-lg shadow-lg mb-6" aria-labelledby="timePreviewHeading">
+        <h2 id="timePreviewHeading" class="text-2xl mb-2 font-bold">Day / Night Preview</h2>
+        <p class="text-sm text-gray-400 mb-4">Approximate 12-hour day / 12-hour night split; actual daylight varies with the in-game season. Night acceleration stacks on top of base time acceleration.</p>
+        <div class="space-y-4" aria-live="polite" aria-atomic="true">
+          <div><h3 class="font-semibold">Loaded settings</h3><p id="timePreviewCurrent"></p></div>
+          <div><h3 class="font-semibold">Unsaved draft</h3><p id="timePreviewDraft"></p></div>
+        </div>
+        <p class="text-sm text-gray-400 mt-4">Edit serverTimeAcceleration and serverNightTimeAcceleration under Config Settings to preview real-time hours. Previewing does not save or restart the server. Use Save All Changes to apply your draft; a verified save does not prove the running game has reloaded it.</p>
+      </section>
+
       <!-- General Settings -->
       <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-6">
         <h2 class="text-2xl mb-4 font-bold">🔧 General Settings</h2>
@@ -68,6 +79,7 @@
 
   <script src="/js/api.js"></script>
   <script src="/js/csrf-helper.js"></script>
+  <script src="/js/dayz-time.js"></script>
   <script src="/js/nitrado-settings.js"></script>
 </body>
 </html>

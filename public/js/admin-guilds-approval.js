@@ -159,7 +159,8 @@ function renderGuildCard(guild) {
               ${statusBadge}
             </div>
             <p class="text-gray-400 text-sm mb-1">Guild ID: ${guildId}</p>
-            <p class="text-gray-400 text-sm mb-1">Owner: ${esc(guild.ownerUsername || guild.addedByUsername || 'Unknown')}</p>
+            <p class="text-gray-400 text-sm mb-1">Owner: ${esc(guild.ownerUsername || guild.addedByUsername || guild.ownerDiscordId || 'Owner details unavailable — complete /register-token or review ownership')}</p>
+            <p class="text-gray-400 text-sm">Bot installation does not identify the installer or assign dashboard roles.</p>
             <p class="text-gray-400 text-sm">Registered: ${esc(createdDate)}</p>
             <p class="text-gray-400 text-sm">Servers: ${Number(guild.serverCount) || 0}</p>
             ${guild.disabledReason ? `<p class="text-red-400 text-sm mt-2">Reason: ${esc(guild.disabledReason)}</p>` : ''}

@@ -23,6 +23,7 @@ const { createApp } = require('./src/app/createApp');
 const { startScheduler } = require('./scheduler');
 const { startEconomyScheduler } = require('./utils/economyScheduler');
 const { startFeedProcessor } = require('./workers/feedProcessor');
+const { startLowLatencyAdmIngestion } = require('./services/lowLatencyAdmIngestionService');
 
 async function startServer() {
   try {
@@ -45,6 +46,8 @@ async function startServer() {
       startEconomyScheduler(db);
       startFeedProcessor(db, 30);
       console.log('✅ Feed processor started');
+      startLowLatencyAdmIngestion(db);
+      console.log('✅ Low-latency ADM ingestion started');
 
       // Start telemetry exporter (if configured)
       try {

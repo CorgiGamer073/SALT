@@ -17,11 +17,15 @@ const axios = require('../../utils/nitradoHttp');
 const { ensureAuthenticated, ensureAdmin } = require('../../middleware/auth');
 const {
   ensureHasOperableServers,
+  ensureHasModeratableServers,
   ensureHasServers,
   ensureApproved,
   ensurePlayerApproved,
+  CAPABILITIES,
+  requirePlatformServerCapability,
   ensurePlatformServerOwner,
 } = require('../../middleware/serverAccess');
+const ensurePlatformServerModerator = requirePlatformServerCapability(CAPABILITIES.SERVER_MODERATE);
 const { apiLimiter, onboardingLimiter, strictLimiter } = require('../../middleware/rateLimiter');
 const { validateToken } = require('../../middleware/validators');
 const { errorHandler, notFoundHandler } = require('../../middleware/errorHandler');
@@ -77,6 +81,7 @@ const casinoRoutes = require('../../routes/casino');
 const lootFinderRoutes = require('../../routes/lootFinder');
 const shopRoutes = require('../../routes/shop');
 const mapHeatmapRoutes = require('../../routes/mapHeatmap');
+const operationsMapRoutes = require('../../routes/operationsMap');
 const spawnExclusionsRoutes = require('../../routes/spawnExclusions');
 const tasksRoutes = require('../../routes/tasks');
 const serverControlRoutes = require('../../routes/serverControl');
@@ -137,6 +142,32 @@ async function listOperableGuilds(db, userId) {
          )
        )
      ORDER BY g.name`,
+    [userId, userId]
+  );
+}
+
+async function listModeratableGuilds(db, userId) {
+  return db.query(
+    `SELECT DISTINCT g.discord_guild_id AS id, g.name, g.icon_url AS icon
+       FROM guilds g
+       LEFT JOIN guild_roles gr ON gr.guild_id = g.id AND gr.user_id = ?
+      WHERE g.status = 'approved'
+        AND (
+          gr.role IN ('owner', 'admin')
+          OR EXISTS (
+            SELECT 1
+              FROM servers s
+              JOIN server_role_assignments sra
+                ON sra.server_id = s.id
+               AND sra.guild_id = s.guild_id
+             WHERE s.guild_id = g.id
+               AND s.status = 'active'
+               AND sra.user_id = ?
+               AND sra.role IN ('admin', 'moderator')
+               AND sra.status = 'active'
+          )
+        )
+      ORDER BY g.name`,
     [userId, userId]
   );
 }
@@ -215,6 +246,7 @@ function registerRoutes(app, csrfProtection) {
   app.use('/api/casino', ensureAuthenticated, ensurePlayerApproved, casinoRoutes);
   app.use('/api/loot', ensureAuthenticated, ensureApproved, lootFinderRoutes);
   app.use('/api/map', ensureAuthenticated, ensurePlayerApproved, mapHeatmapRoutes);
+  app.use('/api/operations-map', ensureAuthenticated, operationsMapRoutes);
   app.use('/api/spawn-exclusions', ensureAuthenticated, spawnExclusionsRoutes);
   app.use('/api/tasks', ensureAuthenticated, ensureApproved, tasksRoutes);
   app.use('/api/control', ensureAuthenticated, ensureApproved, serverControlRoutes);
@@ -281,6 +313,16 @@ function registerRoutes(app, csrfProtection) {
     } catch (err) {
       console.error('❌ Database error:', err);
       res.status(500).json({ success: false, error: 'Database error' });
+    }
+  });
+
+  app.get('/api/user/moderatable-guilds', ensureAuthenticated, async (req, res) => {
+    try {
+      const guilds = await listModeratableGuilds(req.app.locals.db, req.user.id);
+      return res.json({ success: true, guilds });
+    } catch (err) {
+      console.error('❌ Database error:', err);
+      return res.status(500).json({ success: false, error: 'Database error' });
     }
   });
 
@@ -376,7 +418,7 @@ function registerRoutes(app, csrfProtection) {
   });
 
   // Active mission for a server
-  app.get('/api/server-active-mission/:serverId', ensureAuthenticated, ensurePlatformServerOwner, async (req, res) => {
+  app.get('/api/server-active-mission/:serverId', ensureAuthenticated, ensurePlatformServerModerator, async (req, res) => {
     const db = req.app.locals.db;
     const serverId = req.platformServerAccess.platformServerId;
 
@@ -424,7 +466,7 @@ function registerRoutes(app, csrfProtection) {
   });
 
   // Available maps for a server (from local guild downloads)
-  app.get('/api/server-maps/:serverId', ensureAuthenticated, ensurePlatformServerOwner, async (req, res) => {
+  app.get('/api/server-maps/:serverId', ensureAuthenticated, ensurePlatformServerModerator, async (req, res) => {
     const serverId = req.platformServerAccess.platformServerId;
 
     try {
@@ -460,7 +502,7 @@ function registerRoutes(app, csrfProtection) {
   });
 
   // Event spawn locations for a map
-  app.get('/api/event-spawns/:serverId/:mapName', ensureAuthenticated, ensurePlatformServerOwner, async (req, res) => {
+  app.get('/api/event-spawns/:serverId/:mapName', ensureAuthenticated, ensurePlatformServerModerator, async (req, res) => {
     try {
       const serverId = req.platformServerAccess.platformServerId;
       const mapName = String(req.params.mapName || '').toLowerCase();
@@ -985,7 +1027,7 @@ function registerRoutes(app, csrfProtection) {
     renderWithCsrf(pub('dashboard', 'ai-assistant.html'), req, res);
   });
 
-  app.get('/dashboard/server-stats', apiLimiter, ensureAuthenticated, ensureHasServers, (req, res) => {
+  app.get('/dashboard/server-stats', apiLimiter, ensureAuthenticated, ensureHasModeratableServers, (req, res) => {
     console.log('📊 Server stats accessed by:', req.user?.username);
     renderWithCsrf(pub('dashboard', 'server-stats.html'), req, res);
   });
@@ -1037,7 +1079,7 @@ function registerRoutes(app, csrfProtection) {
   });
 
   // Server tools
-  app.get('/map', apiLimiter, ensureAuthenticated, ensureHasServers, (req, res) => {
+  app.get('/map', apiLimiter, ensureAuthenticated, ensureHasModeratableServers, (req, res) => {
     console.log('🗺️  Map page accessed by:', req.user?.username);
     renderWithCsrf(pub('map.html'), req, res);
   });
@@ -1188,4 +1230,9 @@ function registerRoutes(app, csrfProtection) {
   app.use(errorHandler);
 }
 
-module.exports = { getPlayerPortalRootRedirect, listOperableGuilds, registerRoutes };
+module.exports = {
+  getPlayerPortalRootRedirect,
+  listOperableGuilds,
+  listModeratableGuilds,
+  registerRoutes,
+};

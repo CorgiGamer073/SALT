@@ -16,6 +16,13 @@ const {
 const { formatMessage, getDefaultTemplate, formatEmbed, buildKillEmbedPayload } = require('../utils/feedMessageFormatter');
 const { postToDiscord, validateDiscordDestination, MIN_DELAY_MS } = require('../utils/discordPoster');
 const { amountForResponse } = require('../utils/money');
+const {
+  PIPELINES,
+  beginPipelineRun,
+  finishPipelineRun,
+} = require('../services/pipelineStatusService');
+
+let feedTickRunning = false;
 
 /* ─── Stat helpers (queries run at post time against live DB) ─────────────── */
 
@@ -141,31 +148,90 @@ async function fetchWalletBalance(db, identityId, serverId) {
 /**
  * Process all pending feed events
  */
-async function processFeedEvents(db) {
+async function processFeedEvents(db, {
+  intervalSeconds = 30,
+  beginStatus = beginPipelineRun,
+  finishStatus = finishPipelineRun,
+  processServerFeeds = processServerFeedEvents,
+  cleanupEvents = cleanupOldEvents,
+  logger = console,
+} = {}) {
+  if (feedTickRunning) {
+    return { status: 'skipped', queues: 0 };
+  }
+  feedTickRunning = true;
   try {
     const serverQueues = await db.query(
-      `SELECT DISTINCT guild_id, server_id FROM feed_events
-       WHERE (processed = 0 AND next_attempt_at <= CURRENT_TIMESTAMP)
-          OR (processed = 3 AND lease_expires_at <= CURRENT_TIMESTAMP)`
+      `SELECT DISTINCT df.guild_id, df.server_id
+         FROM discord_feeds df
+         JOIN servers s ON s.id = df.server_id AND s.status = 'active'
+         JOIN guilds g ON g.discord_guild_id = df.guild_id AND g.id = s.guild_id
+                        AND g.status = 'approved'
+        WHERE df.enabled = 1
+       UNION
+       SELECT DISTINCT fe.guild_id, fe.server_id
+         FROM feed_events fe
+         JOIN servers s ON s.id = fe.server_id AND s.status = 'active'
+         JOIN guilds g ON g.discord_guild_id = fe.guild_id AND g.id = s.guild_id
+                        AND g.status = 'approved'
+        WHERE (fe.processed = 0 AND fe.next_attempt_at <= CURRENT_TIMESTAMP)
+           OR (fe.processed = 3 AND fe.lease_expires_at <= CURRENT_TIMESTAMP)`
     );
 
-    console.log(`📨 Processing feeds for ${serverQueues.length} server queues`);
+    logger.log(`📨 Processing feeds for ${serverQueues.length} server queues`);
 
+    let failed = 0;
     for (const { guild_id, server_id } of serverQueues) {
-      await processServerFeedEvents(db, guild_id, server_id);
+      let pipelineRun = null;
+      try {
+        pipelineRun = await beginStatus(db, {
+          serverId: Number(server_id),
+          pipeline: PIPELINES.FEED_PROCESSOR,
+          intervalSeconds,
+        });
+      } catch (error) {
+        logger.error?.(`[feed] failed to record start for server ${server_id}:`, error.message);
+      }
+
+      let outcome;
+      try {
+        outcome = await processServerFeeds(db, guild_id, server_id);
+      } catch (error) {
+        logger.error?.(`❌ Error processing server ${server_id} feeds in guild ${guild_id}:`, error.message);
+        outcome = { status: 'failed', events: 0 };
+      }
+      if (outcome.status === 'failed') failed += 1;
+      if (pipelineRun) {
+        await finishStatus(db, pipelineRun, {
+          status: outcome.status === 'failed' ? 'failed' : 'healthy',
+          errorCode: outcome.status === 'failed' ? 'FEED_PROCESSING_FAILED' : null,
+          counters: { claimed: outcome.events || 0, failed: outcome.failed || 0 },
+        }).catch(error => {
+          logger.error?.(`[feed] failed to record completion for server ${server_id}:`, error.message);
+        });
+      }
     }
 
-    await cleanupOldEvents(db);
-
+    await cleanupEvents(db);
+    return {
+      status: failed > 0 ? 'degraded' : 'succeeded',
+      queues: serverQueues.length,
+      failed,
+    };
   } catch (error) {
-    console.error('❌ Error processing feed events:', error);
+    logger.error('❌ Error processing feed events:', error);
+    return { status: 'failed', queues: 0 };
+  } finally {
+    feedTickRunning = false;
   }
 }
 
 /**
  * Process events for a specific server within a Discord guild.
  */
-async function processServerFeedEvents(db, guildId, serverId) {
+async function processServerFeedEvents(db, guildId, serverId, {
+  processOne = processEvent,
+} = {}) {
   try {
     const [killFeedConfig, factionFeedConfig] = await Promise.all([
       db.get(`SELECT * FROM discord_feeds WHERE guild_id = ? AND server_id = ? AND feed_type = 'kill_feed'    AND enabled = 1`, [guildId, serverId]),
@@ -188,7 +254,7 @@ async function processServerFeedEvents(db, guildId, serverId) {
       } else {
         console.log(`⏭️ No active feeds for server ${serverId} in guild ${guildId}`);
       }
-      return;
+      return { status: 'succeeded', events: 0 };
     }
 
     const events = await claimPendingEvents(db, guildId, serverId, 50, enabledFeedTypes);
@@ -197,24 +263,29 @@ async function processServerFeedEvents(db, guildId, serverId) {
     const killSettings    = killFeedConfig    ? (JSON.parse(killFeedConfig.settings    || '{}')) : null;
     const factionSettings = factionFeedConfig ? (JSON.parse(factionFeedConfig.settings || '{}')) : null;
 
+    let failed = 0;
     for (let i = 0; i < events.length; i++) {
       const event = events[i];
+      let outcome;
 
       if (event.feed_type === 'faction_feed' && factionFeedConfig) {
-        await processEvent(db, event, factionFeedConfig, factionSettings);
+        outcome = await processOne(db, event, factionFeedConfig, factionSettings);
       } else if (event.feed_type === 'kill_feed' && killFeedConfig) {
-        await processEvent(db, event, killFeedConfig, killSettings);
+        outcome = await processOne(db, event, killFeedConfig, killSettings);
       } else {
         console.log(`⏸️ Keeping ${event.feed_type} event ${event.id} pending; no matching enabled feed`);
+        outcome = 'failed';
       }
+      if (outcome === 'failed') failed += 1;
 
       if (i < events.length - 1) {
         await new Promise(resolve => setTimeout(resolve, MIN_DELAY_MS));
       }
     }
-
+    return { status: failed > 0 ? 'failed' : 'succeeded', events: events.length, failed };
   } catch (error) {
     console.error(`❌ Error processing server ${serverId} feeds in guild ${guildId}:`, error);
+    return { status: 'failed', events: 0 };
   }
 }
 
@@ -229,7 +300,7 @@ async function processEvent(db, event, feedConfig, settings) {
     if (!shouldPostEvent(event.event_type, eventData, settings)) {
       console.log(`⏭️ Skipping ${event.event_type} (filtered)`);
       await markEventProcessed(db, event.id, true, event.claim_token);
-      return;
+      return 'succeeded';
     }
 
     const server = await db.get(
@@ -242,7 +313,7 @@ async function processEvent(db, event, feedConfig, settings) {
     );
     if (!server) {
       await markEventProcessed(db, event.id, false, event.claim_token);
-      return;
+      return 'failed';
     }
     const serverName = server?.name || 'Server';
 
@@ -252,7 +323,7 @@ async function processEvent(db, event, feedConfig, settings) {
       feedConfig.webhook_url
     ))) {
       await markEventProcessed(db, event.id, false, event.claim_token);
-      return;
+      return 'failed';
     }
 
     let content;
@@ -280,14 +351,17 @@ async function processEvent(db, event, feedConfig, settings) {
     if (success) {
       await markEventProcessed(db, event.id, true, event.claim_token);
       console.log(`✅ Posted ${event.event_type} to Discord`);
-    } else {
-      await markEventFailed(db, event.id, event.claim_token, new Error('Discord delivery failed'));
-      console.error(`❌ Failed to post ${event.event_type}; retry scheduled`);
+      return 'succeeded';
     }
+
+    await markEventFailed(db, event.id, event.claim_token, new Error('Discord delivery failed'));
+    console.error(`❌ Failed to post ${event.event_type}; retry scheduled`);
+    return 'failed';
 
   } catch (error) {
     console.error(`❌ Error processing event ${event.id}:`, error);
     await markEventFailed(db, event.id, event.claim_token, error);
+    return 'failed';
   }
 }
 
@@ -392,13 +466,17 @@ async function getTemplate(db, serverId, feedType, eventType) {
 /* ─── Worker ──────────────────────────────────────────────────────────────── */
 
 function startFeedProcessor(db, intervalSeconds = 30) {
+  const run = () => processFeedEvents(db, { intervalSeconds });
   console.log(`🚀 Starting feed processor (interval: ${intervalSeconds}s)`);
-  processFeedEvents(db);
-  setInterval(() => processFeedEvents(db), intervalSeconds * 1000);
+  run();
+  const timer = setInterval(run, intervalSeconds * 1000);
+  timer.unref?.();
+  return timer;
 }
 
 module.exports = {
   processFeedEvents,
+  processServerFeedEvents,
   startFeedProcessor,
   fetchVictimTimeAlive,
   fetchWalletBalance,

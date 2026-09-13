@@ -8,6 +8,7 @@ const path = require('path');
 const http = require('../utils/httpRetry');
 const {
   classifyLogEntry,
+  downloadActiveServerLog,
   downloadLogFile,
   normalizeNitradoFilePath,
   resolveOperationalServers,
@@ -15,6 +16,7 @@ const {
   validateLogFileEntry,
 } = require('../services/logSyncService');
 const { compareLogFileEntries, logStartTimeMs } = require('../utils/logFileChronology');
+const { createProviderLogAvailabilityTracker } = require('../utils/providerLogAvailability');
 const {
   buildScheduledLogSyncPlan,
   isLogSyncRunSuccessful,
@@ -163,6 +165,86 @@ function testRoutineSyncPreservesHistoryInBoundedDurableBatches() {
   }
 }
 
+function testRoutineSyncDefersTheActivelyGrowingRptGeneration() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-log-active-rpt-'));
+  const activeRpt = {
+    name: 'DayZServer_x64_2026-09-13_07-45-32.RPT',
+    size: 64,
+    modified_at: Date.parse('2026-09-13T14:40:00Z'),
+  };
+  const completedRpt = {
+    name: 'DayZServer_x64_2026-09-13_04-25-20.RPT',
+    size: 32,
+    modified_at: Date.parse('2026-09-13T07:45:00Z'),
+  };
+  const entries = [
+    completedRpt,
+    activeRpt,
+    {
+      name: 'DayZServer_x64_2026-09-13_07-45-32.ADM',
+      size: 16,
+      modified_at: Date.parse('2026-09-13T14:40:00Z'),
+    },
+  ];
+
+  try {
+    const selectedWhileStarted = selectLogSyncBatch(directory, entries, {
+      gameserver: {
+        status: 'started',
+        last_status_change: Date.parse('2026-09-13T11:45:32Z') / 1000,
+      },
+    });
+    assert.ok(!selectedWhileStarted.some(entry => entry.name === activeRpt.name),
+      'the RPT generation matching the active provider session must wait until rotation');
+    assert.ok(selectedWhileStarted.some(entry => entry.name === completedRpt.name),
+      'the previous completed RPT must remain eligible for restart evidence');
+    assert.ok(selectedWhileStarted.some(entry => entry.name.endsWith('.ADM')),
+      'active ADM ingestion must remain independent from deferred RPT transfer');
+
+    const sessionStartedAt = Date.parse('2026-09-13T15:45:32Z');
+    const oneMillisecondBeforeStart = selectLogSyncBatch(directory, [
+      { ...activeRpt, modified_at: sessionStartedAt - 1 },
+    ], {
+      gameserver: { status: 'started', last_status_change: sessionStartedAt / 1000 },
+    });
+    assert.ok(oneMillisecondBeforeStart.some(entry => entry.name === activeRpt.name),
+      'provider modification before session start must retain strict transfer validation');
+    const exactlyAtStart = selectLogSyncBatch(directory, [
+      { ...activeRpt, modified_at: sessionStartedAt },
+    ], {
+      gameserver: { status: 'started', last_status_change: sessionStartedAt / 1000 },
+    });
+    assert.deepStrictEqual(exactlyAtStart, [],
+      'provider modification at session start may identify the active RPT generation');
+
+    const selectedBeforeCurrentRptPublication = selectLogSyncBatch(directory, entries, {
+      gameserver: {
+        status: 'started',
+        last_status_change: sessionStartedAt / 1000,
+      },
+    });
+    assert.ok(selectedBeforeCurrentRptPublication.some(entry => entry.name === activeRpt.name),
+      'a completed prior-session RPT must remain strict until current-session publication is observable');
+
+    const selectedForUncorrelatedStart = selectLogSyncBatch(directory, entries, {
+      gameserver: {
+        status: 'started',
+        last_status_change: Date.parse('2026-09-15T11:45:32Z') / 1000,
+      },
+    });
+    assert.ok(selectedForUncorrelatedStart.some(entry => entry.name === activeRpt.name),
+      'an uncorrelated newest RPT must fail closed into ordinary strict transfer');
+
+    const selectedWhileStopped = selectLogSyncBatch(directory, entries, {
+      gameserver: { status: 'stopped', last_status_change: Date.parse('2026-09-13T11:45:32Z') / 1000 },
+    });
+    assert.ok(selectedWhileStopped.some(entry => entry.name === activeRpt.name),
+      'the newest RPT must become eligible once the provider session is no longer active');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function testRoutineSyncIncludesProviderLatestAdmAcrossBatchBoundary() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-log-provider-latest-'));
   const admEntries = Array.from({ length: 8 }, (_, index) => ({
@@ -299,9 +381,14 @@ function testServerLogUsesMissingFileClassification() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'services', 'logSyncService.js'), 'utf8');
   assert.match(source, /classifyLogEntry\(configPath, serverLogEntry\)/);
   assert.doesNotMatch(source, /localSize !== serverLogEntry\.size/);
+  assert.strictEqual(
+    (source.match(/await downloadActiveServerLog\(/g) || []).length,
+    2,
+    'serial and concurrent server.log paths must use the growth-aware downloader'
+  );
   assert.doesNotMatch(
     source,
-    /downloadLogFile\(token, serverId, serverLogEntry[\s\S]{0,250}serverChanged = true/
+    /downloadActiveServerLog\(token, serverId, serverLogEntry[\s\S]{0,350}serverChanged = true/
   );
 }
 
@@ -568,6 +655,116 @@ async function testIncompleteDownloadPreservesExistingFile() {
   }
 }
 
+async function testActiveServerLogRelistsAndRetriesGrowthRace() {
+  const relativeDirectory = path.join('.test-active-server-log', String(process.pid));
+  const localPath = path.join(__dirname, '..', 'downloads', relativeDirectory, 'server.log');
+  const providerPath = '/games/101/noftp/dayzxb/config/server.log';
+  const configPath = '/games/101/noftp/dayzxb/config';
+  const originalGet = http.get;
+  fs.mkdirSync(path.dirname(localPath), { recursive: true });
+  fs.writeFileSync(localPath, 'complete-old-copy');
+
+  const requests = [];
+  http.get = async url => {
+    requests.push(url);
+    if (requests.length === 1 || requests.length === 4) {
+      return {
+        data: {
+          status: 'success',
+          data: { token: { url: `https://download.example.test/server-${requests.length}.log` } },
+        },
+      };
+    }
+    if (requests.length === 2 || requests.length === 5) {
+      return { data: Buffer.from('grown-body') };
+    }
+    return {
+      data: {
+        status: 'success',
+        data: {
+          entries: [{ type: 'file', name: 'server.log', path: providerPath, size: 10 }],
+        },
+      },
+    };
+  };
+
+  try {
+    const changed = await downloadActiveServerLog('test-token', '101', {
+      type: 'file',
+      name: 'server.log',
+      path: providerPath,
+      size: 4,
+    }, localPath, {
+      gameserver: { status: 'started' },
+      configPathOnProvider: configPath,
+    });
+    assert.strictEqual(changed, true);
+    assert.strictEqual(fs.readFileSync(localPath, 'utf8'), 'grown-body');
+    assert.strictEqual(requests.length, 5, 'an active growth race must trigger exactly one re-list and retry');
+    assert.match(requests[2], /file_server\/list\?dir=/);
+  } finally {
+    http.get = originalGet;
+    fs.rmSync(path.join(__dirname, '..', 'downloads', '.test-active-server-log'), { recursive: true, force: true });
+  }
+}
+
+async function testActiveServerLogKeepsPriorCopyWhenBoundedRetryStillRaces() {
+  const relativeDirectory = path.join('.test-active-server-log-retry', String(process.pid));
+  const localPath = path.join(__dirname, '..', 'downloads', relativeDirectory, 'server.log');
+  const providerPath = '/games/101/noftp/dayzxb/config/server.log';
+  const originalGet = http.get;
+  fs.mkdirSync(path.dirname(localPath), { recursive: true });
+  fs.writeFileSync(localPath, 'complete-old-copy');
+
+  let requestCount = 0;
+  http.get = async () => {
+    requestCount++;
+    if (requestCount === 1 || requestCount === 4) {
+      return {
+        data: {
+          status: 'success',
+          data: { token: { url: `https://download.example.test/server-${requestCount}.log` } },
+        },
+      };
+    }
+    if (requestCount === 2) return { data: Buffer.from('grown-body') };
+    if (requestCount === 3) {
+      return {
+        data: {
+          status: 'success',
+          data: {
+            entries: [{ type: 'file', name: 'server.log', path: providerPath, size: 12 }],
+          },
+        },
+      };
+    }
+    return { data: Buffer.from('still-growing') };
+  };
+
+  try {
+    await assert.rejects(
+      downloadActiveServerLog('test-token', '101', {
+        type: 'file',
+        name: 'server.log',
+        path: providerPath,
+        size: 4,
+      }, localPath, {
+        gameserver: { status: 'started' },
+        configPathOnProvider: '/games/101/noftp/dayzxb/config',
+      }),
+      /incomplete/i
+    );
+    assert.strictEqual(requestCount, 5, 'a persistent race must stop after one bounded retry');
+    assert.strictEqual(fs.readFileSync(localPath, 'utf8'), 'complete-old-copy');
+  } finally {
+    http.get = originalGet;
+    fs.rmSync(path.join(__dirname, '..', 'downloads', '.test-active-server-log-retry'), {
+      recursive: true,
+      force: true,
+    });
+  }
+}
+
 async function testVerifiedIdenticalDownloadDoesNotRewriteOrMarkChanged() {
   const relativeDirectory = path.join('.test-log-sync-identical', String(process.pid));
   const localPath = path.join(__dirname, '..', 'downloads', relativeDirectory, 'active.ADM');
@@ -611,9 +808,13 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
   let includeAdmLogs = true;
   let includeRptLogs = false;
   let includeServerLog = true;
+  let incompleteServerLogDownloads = true;
   let incompleteRptDownloads = true;
+  let gameserverStatus = null;
+  let gameserverLastStatusChange = null;
   let extraLogNames = [];
   let extraLogEntries = [];
+  const missingConfigServerIds = new Set();
   const requestedUrls = [];
 
   encryption.decryptToken = () => 'test-token';
@@ -621,10 +822,14 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
     getRawGameserver: async (_token, serverId) => serverId === '102'
       ? {
         game: 'dayzstandalone',
+        status: gameserverStatus,
+        last_status_change: gameserverLastStatusChange,
         game_specific: { path: `/games/${serverId}/ftproot/dayzstandalone` },
       }
       : {
         game: 'dayzxb',
+        status: gameserverStatus,
+        last_status_change: gameserverLastStatusChange,
         game_specific: { path: `/games/${serverId}/noftp/dayzxb` },
       },
   });
@@ -653,6 +858,7 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
                 name: `DayZServer_x64_2026-09-04_22-00-00.RPT`,
                 path: `/games/${serverId}/${dialect}/${dataDirectory}/config/DayZServer_x64_2026-09-04_22-00-00.RPT`,
                 size: 8,
+                modified_at: Date.parse('2026-09-05T02:10:00Z'),
               }] : []),
               ...(includeServerLog ? [{
                 type: 'file',
@@ -677,11 +883,17 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
         data: {
           status: 'success',
           data: {
-            entries: [{
-              type: 'dir',
-              name: dataDirectory,
-              path: `/games/${serverId}/${dialect}/${dataDirectory}`,
-            }],
+            entries: missingConfigServerIds.has(serverId)
+              ? [{
+                type: 'dir',
+                name: `${dataDirectory}_missions`,
+                path: `/games/${serverId}/ftproot/${dataDirectory}_missions`,
+              }]
+              : [{
+                type: 'dir',
+                name: dataDirectory,
+                path: `/games/${serverId}/${dialect}/${dataDirectory}`,
+              }],
           },
         },
       };
@@ -696,7 +908,7 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
       };
     }
     if (String(url).startsWith('https://download.example.test/')) {
-      const incomplete = String(url).endsWith('/server.log') ||
+      const incomplete = (incompleteServerLogDownloads && String(url).endsWith('/server.log')) ||
         (incompleteRptDownloads && String(url).endsWith('.RPT'));
       return { data: Buffer.from(incomplete ? 'short' : 'complete') };
     }
@@ -766,6 +978,30 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
         'an incomplete RPT must disable local RPT parsing for only that server'
       );
     }
+
+    includeAdmLogs = false;
+    incompleteServerLogDownloads = false;
+    gameserverStatus = 'started';
+    gameserverLastStatusChange = Date.parse('2026-09-05T02:00:00Z') / 1000;
+    for (const sync of [syncService.performLogSync, syncService.performLogSyncConcurrent]) {
+      fs.rmSync(path.join(__dirname, '..', 'downloads', guildId), { recursive: true, force: true });
+      const requestStart = requestedUrls.length;
+      const result = await sync(db, 7, 'test-token', ['101']);
+      const runUrls = requestedUrls.slice(requestStart);
+      assert.deepStrictEqual(result.errors, [],
+        'an active-RPT-only inventory must not become a false blocking sync failure');
+      assert.deepStrictEqual(result.failedServerIds, []);
+      assert.ok(!runUrls.some(url => url.endsWith('.RPT')),
+        'the correlated active RPT must not be transferred while it is growing');
+      assert.strictEqual(result.restartEvidence['101'].latestRptPath.endsWith(
+        'DayZServer_x64_2026-09-04_22-00-00.RPT'
+      ), true, 'deferred current RPT metadata must remain available to restart processing');
+    }
+    includeAdmLogs = true;
+    incompleteServerLogDownloads = true;
+    gameserverStatus = null;
+    gameserverLastStatusChange = null;
+
     const rptFilename = 'DayZServer_x64_2026-09-04_22-00-00.RPT';
     const outsideRpt = path.join(os.tmpdir(), `dayz-log-sync-rpt-${process.pid}-${Date.now()}`);
     fs.writeFileSync(outsideRpt, 'outside');
@@ -1021,6 +1257,37 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
         'missing server.log must not block parsing independently verified ADM files'
       );
     }
+
+    includeServerLog = true;
+    missingConfigServerIds.add('101');
+    for (const [sync, concurrent] of [
+      [syncService.performLogSync, false],
+      [syncService.performLogSyncConcurrent, true],
+    ]) {
+      const availabilityTracker = createProviderLogAvailabilityTracker({
+        baseBackoffMs: 5 * 60 * 1000,
+        maxBackoffMs: 5 * 60 * 1000,
+      });
+      const options = {
+        respectAvailabilityBackoff: true,
+        availabilityTracker,
+        nowMs: () => Date.parse('2026-09-13T15:00:00.000Z'),
+      };
+      const run = () => concurrent
+        ? sync(db, 7, 'test-token', ['101'], null, options)
+        : sync(db, 7, 'test-token', ['101'], options);
+      const first = await run();
+      assert.deepStrictEqual(first.failedServerIds, ['101']);
+      assert.ok(first.errors.some(error => /No DayZ config directory found/i.test(error)));
+      const requestsAfterFirst = requestedUrls.length;
+
+      const second = await run();
+      assert.deepStrictEqual(second.failedServerIds, ['101']);
+      assert.ok(second.errors.some(error => /temporarily backed off/i.test(error)));
+      assert.strictEqual(requestedUrls.length, requestsAfterFirst,
+        'scheduled sync must not poll unavailable provider storage again during backoff');
+    }
+    missingConfigServerIds.clear();
   } finally {
     http.get = originalGet;
     encryption.decryptToken = originalDecryptToken;
@@ -1217,17 +1484,151 @@ async function testStreamingParserDiscoversEventOnlyParticipants() {
   }
 }
 
-async function testStreamingParserRejectsUnknownDisconnectIdentity() {
+async function testStreamingParserRejectsSentinelDisconnectIdentities() {
   const { parseADMFileStream } = require('../routes/logParser');
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-unknown-disconnect-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-sentinel-disconnect-'));
   const logPath = path.join(directory, 'events.ADM');
-  fs.writeFileSync(logPath, '00:01:00 | Player "Anonymous" (id=Unknown) has been disconnected\n');
+  fs.writeFileSync(logPath, [
+    '00:01:00 | Player "Anonymous" (id=Unknown) has been disconnected',
+    '00:02:00 | Player "Provider Failure" (id=ERROR) has been disconnected',
+  ].join('\n'));
 
   try {
     const parsed = await parseADMFileStream(logPath, '2026-08-29');
     assert.deepStrictEqual(parsed.players, []);
     assert.deepStrictEqual(parsed.sessions, []);
     assert.deepStrictEqual(parsed.onlineUpdates, []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function testCompletePlayerListSnapshotOverridesConnectionBalance() {
+  const { parseADMFileStream, updateOnlineState } = require('../routes/logParser');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-player-list-authority-'));
+  const logPath = path.join(directory, 'events.ADM');
+  fs.writeFileSync(logPath, [
+    '01:00:00 | Player "Departed" (id=AAAA1111) is connecting',
+    '01:05:00 | Player "Departed" (id=AAAA1111 pos=<1.0, 2.0, 3.0>) has been disconnected',
+    '01:10:00 | ##### PlayerList log: 2 players',
+    '01:10:00 | Player "Present One" (id=BBBB2222 pos=<4.0, 5.0, 6.0>)',
+    '01:10:00 | Player "Present Two" (id=CCCC3333 pos=<7.0, 8.0, 9.0>)',
+    '01:10:00 | #####',
+  ].join('\n'));
+
+  try {
+    const parsed = await parseADMFileStream(logPath, '2026-09-07', { platform: 'xbox' });
+    const online = new Map();
+    updateOnlineState(parsed.onlineUpdates, online);
+    assert.deepStrictEqual([...online.keys()].sort(), ['BBBB2222', 'CCCC3333'],
+      'the latest complete PlayerList block must be authoritative for online names');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function testMalformedPlayerListSnapshotDoesNotReplaceOnlineState() {
+  const { parseADMFileStream, updateOnlineState } = require('../routes/logParser');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-player-list-malformed-'));
+  const logPath = path.join(directory, 'events.ADM');
+  fs.writeFileSync(logPath, [
+    '01:00:00 | Player "Prior" (id=AAAA1111) is connecting',
+    '01:10:00 | ##### PlayerList log: 2 players',
+    '01:10:00 | Player "Present One" (id=BBBB2222 pos=<4.0, 5.0, 6.0>)',
+    '01:10:00 | Player "Present Two" (id=CCCC3333 pos=<7.0, 8.0, 9.0>)',
+    '01:10:00 | Player malformed extra row',
+    '01:10:00 | #####',
+  ].join('\n'));
+
+  try {
+    const parsed = await parseADMFileStream(logPath, '2026-09-07', { platform: 'xbox' });
+    const online = new Map();
+    updateOnlineState(parsed.onlineUpdates, online);
+    assert.deepStrictEqual([...online.keys()], ['AAAA1111'],
+      'a malformed PlayerList block must not replace prior online state');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function testInvalidPlayerListSnapshotsPreservePriorOnlineState() {
+  const { parseADMFileStream, updateOnlineState } = require('../routes/logParser');
+  const cases = [
+    {
+      name: 'duplicate identity',
+      lines: [
+        '01:10:00 | ##### PlayerList log: 2 players',
+        '01:10:00 | Player "First" (id=BBBB2222 pos=<1.0, 2.0, 3.0>)',
+        '01:10:00 | Player "Duplicate" (id=BBBB2222 pos=<4.0, 5.0, 6.0>)',
+        '01:10:00 | #####',
+      ],
+    },
+    {
+      name: 'under-count',
+      lines: [
+        '01:10:00 | ##### PlayerList log: 2 players',
+        '01:10:00 | Player "Only One" (id=BBBB2222 pos=<1.0, 2.0, 3.0>)',
+        '01:10:00 | #####',
+      ],
+    },
+    {
+      name: 'over-count',
+      lines: [
+        '01:10:00 | ##### PlayerList log: 1 players',
+        '01:10:00 | Player "First" (id=BBBB2222 pos=<1.0, 2.0, 3.0>)',
+        '01:10:00 | Player "Extra" (id=CCCC3333 pos=<4.0, 5.0, 6.0>)',
+        '01:10:00 | #####',
+      ],
+    },
+    {
+      name: 'unterminated block',
+      lines: [
+        '01:10:00 | ##### PlayerList log: 1 players',
+        '01:10:00 | Player "First" (id=BBBB2222 pos=<1.0, 2.0, 3.0>)',
+      ],
+    },
+  ];
+
+  for (const fixture of cases) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-player-list-invalid-'));
+    const logPath = path.join(directory, 'events.ADM');
+    fs.writeFileSync(logPath, [
+      '01:00:00 | Player "Prior" (id=AAAA1111) is connecting',
+      ...fixture.lines,
+    ].join('\n'));
+    try {
+      const parsed = await parseADMFileStream(logPath, '2026-09-07', { platform: 'xbox' });
+      const online = new Map();
+      updateOnlineState(parsed.onlineUpdates, online);
+      assert.deepStrictEqual([...online.keys()], ['AAAA1111'],
+        `${fixture.name} must not replace prior online state`);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  }
+}
+
+async function testPlayerListSnapshotPreservesKnownLoginAcrossRotation() {
+  const { parseADMFileStream, updateOnlineState } = require('../routes/logParser');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dayz-player-list-rotation-'));
+  const firstPath = path.join(directory, 'DayZServer_X1_x64_2026-09-07_01-00-00.ADM');
+  const secondPath = path.join(directory, 'DayZServer_X1_x64_2026-09-07_04-00-00.ADM');
+  fs.writeFileSync(firstPath, '01:00:00 | Player "Known" (id=AAAA1111) is connecting\n');
+  fs.writeFileSync(secondPath, [
+    '04:10:00 | ##### PlayerList log: 2 players',
+    '04:10:00 | Player "Known" (id=AAAA1111 pos=<1.0, 2.0, 3.0>)',
+    '04:10:00 | Player "Snapshot Only" (id=BBBB2222 pos=<4.0, 5.0, 6.0>)',
+    '04:10:00 | #####',
+  ].join('\n'));
+
+  try {
+    const online = new Map();
+    const first = await parseADMFileStream(firstPath, '2026-09-07', { platform: 'xbox' });
+    const second = await parseADMFileStream(secondPath, '2026-09-07', { platform: 'xbox' });
+    updateOnlineState(first.onlineUpdates, online);
+    updateOnlineState(second.onlineUpdates, online);
+    assert.strictEqual(online.get('AAAA1111').loginAt, '2026-09-07T01:00:00Z');
+    assert.strictEqual(online.get('BBBB2222').loginAt, null);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -2652,11 +3053,14 @@ async function main() {
   testPcProviderPathsNormalizeToNoFtp();
   testValidatedPcFileEntryPreservesProviderTransferPath();
   testRoutineSyncPreservesHistoryInBoundedDurableBatches();
+  testRoutineSyncDefersTheActivelyGrowingRptGeneration();
   testRoutineSyncIncludesProviderLatestAdmAcrossBatchBoundary();
   testRoutineSyncSkipsTemporarilyUnfittableHistoryWithoutStarvingLaterFiles();
   testRoutineSyncRejectsInvalidMandatoryArtifactSizes();
   await testOversizedAdvertisedLogIsRejectedBeforeTransfer();
   await testIncompleteDownloadPreservesExistingFile();
+  await testActiveServerLogRelistsAndRetriesGrowthRace();
+  await testActiveServerLogKeepsPriorCopyWhenBoundedRetryStillRaces();
   await testVerifiedIdenticalDownloadDoesNotRewriteOrMarkChanged();
   testParserOrdersByLogStartInsteadOfDownloadTime();
   testInvalidFilenameTimestampUsesFallbackChronology();
@@ -2682,7 +3086,11 @@ async function main() {
   testLogInventoryRejectsSymlinkBaseDirectory();
   await testMissingEventIdentityFailsClosed();
   await testStreamingParserDiscoversEventOnlyParticipants();
-  await testStreamingParserRejectsUnknownDisconnectIdentity();
+  await testStreamingParserRejectsSentinelDisconnectIdentities();
+  await testCompletePlayerListSnapshotOverridesConnectionBalance();
+  await testMalformedPlayerListSnapshotDoesNotReplaceOnlineState();
+  await testInvalidPlayerListSnapshotsPreservePriorOnlineState();
+  await testPlayerListSnapshotPreservesKnownLoginAcrossRotation();
   await testStreamingParserPreservesConsoleBase64UrlIdentity();
   await testStreamingParserNormalizesAndFiltersEveryEventIdentity();
   await testCombatParserUsesPlatformAwareIdentityBoundary();

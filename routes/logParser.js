@@ -3,6 +3,7 @@ const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 const nitradoService = require('../services/nitradoService');
 const { validatePagination, validateSort } = require('../middleware/validators');
 const { ensureAuthenticated } = require('../middleware/auth');
@@ -15,13 +16,25 @@ const moneySupplyManager = require('../utils/moneySupplyManager');
 const { queueKillEvent } = require('../utils/feedEventQueue');
 const { resolveGuildDiscordId, getGuildDownloadPath } = require('../services/logSyncService');
 const { detectDayzPlatform } = require('../utils/dayzPlatform');
-const { compareLogFileEntries, logStartTimeMs, parseStrictTimestampMs } = require('../utils/logFileChronology');
+const {
+  compareLogFileEntries,
+  isSupportedAdmFilename,
+  isSupportedRptFilename,
+  logStartTimeMs,
+  parseStrictTimestampMs,
+} = require('../utils/logFileChronology');
+const { acquireExactServerLogLocks } = require('../utils/logIngestionLock');
 const {
   markTeleportArrivals,
   processTeleportCleanups,
   processWaitingTeleports,
 } = require('../services/teleportProcessorService');
 const { openContainedFileSync } = require('../utils/safePath');
+const { parseRptClockTimestamp: parseSharedRptClockTimestamp } = require('../utils/rptChronology');
+const {
+  createRptTelemetryCollector,
+  replaceRptTelemetryEvents,
+} = require('../services/rptTelemetryService');
 const {
   lockActiveCaptureServer,
   applyEmoteEventToCaptureInTransaction,
@@ -32,7 +45,7 @@ const DAYZ_PLAYER_ID_REGEX = new RegExp(`^${DAYZ_PLAYER_ID_PATTERN}$`);
 
 function normalizeDayzPlayerId(value, platform = null) {
   const playerId = String(value ?? '').trim();
-  if (!playerId || playerId.length > 128 || /^unknown$/i.test(playerId) || !DAYZ_PLAYER_ID_REGEX.test(playerId)) {
+  if (!playerId || playerId.length > 128 || /^(?:unknown|error)$/i.test(playerId) || !DAYZ_PLAYER_ID_REGEX.test(playerId)) {
     return null;
   }
   return normalizeParserPlatform(platform) === 'xbox' && /^[A-Fa-f0-9]+$/.test(playerId)
@@ -423,26 +436,6 @@ function openLogFile(filePath, rootDir = path.dirname(filePath)) {
   return openContainedFileSync(rootDir, relativePath);
 }
 
-function readLogFileSafely(filePath, { fullHistory = false, rootDir = path.dirname(filePath) } = {}) {
-  const { fd, stat } = openLogFile(filePath, rootDir);
-  try {
-    if (fullHistory || stat.size <= MAX_LOG_FILE_BYTES) {
-      return fs.readFileSync(fd, 'utf-8');
-    }
-
-    const sizeMB = Math.round(stat.size / 1024 / 1024);
-    console.warn(`⚠️  Log file is ${sizeMB} MB — reading last ${MAX_LOG_FILE_BYTES / 1024 / 1024} MB only: ${path.basename(filePath)}`);
-
-    const buf = Buffer.alloc(MAX_LOG_FILE_BYTES);
-    fs.readSync(fd, buf, 0, MAX_LOG_FILE_BYTES, stat.size - MAX_LOG_FILE_BYTES);
-    const content = buf.toString('utf-8');
-    const firstNewline = content.indexOf('\n');
-    return firstNewline >= 0 ? content.slice(firstNewline + 1) : content;
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
 /**
  * Async generator that streams lines from a log file without loading the
  * entire content into a string.  For files larger than MAX_LOG_FILE_BYTES,
@@ -458,21 +451,49 @@ function readLogFileSafely(filePath, { fullHistory = false, rootDir = path.dirna
 async function* streamLogLines(filePath, {
   fullHistory = false,
   rootDir = path.dirname(filePath),
+  startOffset = null,
+  endOffsetExclusive = null,
+  sourceLineBase = null,
 } = {}) {
   const { fd, stat } = openLogFile(filePath, rootDir);
-  const start = !fullHistory && stat.size > MAX_LOG_FILE_BYTES ? stat.size - MAX_LOG_FILE_BYTES : 0;
-  const sourceLineBase = countNewlinesBeforeFd(fd, start);
+  const explicitRange = startOffset !== null;
+  const start = explicitRange
+    ? Number(startOffset)
+    : (!fullHistory && stat.size > MAX_LOG_FILE_BYTES ? stat.size - MAX_LOG_FILE_BYTES : 0);
+  const endExclusive = endOffsetExclusive === null ? stat.size : Number(endOffsetExclusive);
+  if (!Number.isSafeInteger(start) || start < 0 || start > stat.size ||
+      !Number.isSafeInteger(endExclusive) || endExclusive < start || endExclusive > stat.size) {
+    fs.closeSync(fd);
+    throw new Error('Invalid incremental ADM byte range');
+  }
+  const resolvedLineBase = sourceLineBase === null
+    ? countNewlinesBeforeFd(fd, start)
+    : Number(sourceLineBase);
+  if (!Number.isSafeInteger(resolvedLineBase) || resolvedLineBase < 0) {
+    fs.closeSync(fd);
+    throw new Error('Invalid incremental ADM source-line cursor');
+  }
 
-  if (start > 0) {
+  if (!explicitRange && start > 0) {
     const sizeMB = Math.round(stat.size / 1024 / 1024);
     console.warn(`⚠️  Log ${path.basename(filePath)} is ${sizeMB} MB — streaming last ${MAX_LOG_FILE_BYTES / 1024 / 1024} MB`);
   }
+  if (endExclusive === start) {
+    fs.closeSync(fd);
+    return;
+  }
 
-  const fileStream = fs.createReadStream(filePath, { fd, start, encoding: 'utf8', autoClose: true });
+  const fileStream = fs.createReadStream(filePath, {
+    fd,
+    start,
+    end: endExclusive - 1,
+    encoding: 'utf8',
+    autoClose: true,
+  });
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
-  let skipFirst = start > 0;
-  let sourceLineIndex = sourceLineBase - 1;
+  let skipFirst = !explicitRange && start > 0;
+  let sourceLineIndex = resolvedLineBase - 1;
   try {
     for await (const line of rl) {
       sourceLineIndex++;
@@ -536,6 +557,10 @@ async function parseADMFileStream(filePath, logDate, {
   sessionState = new Map(),
   includeActiveSessions = true,
   platform = null,
+  startOffset = null,
+  endOffsetExclusive = null,
+  sourceLineBase = null,
+  initialPreviousLineTimestamp = null,
 } = {}) {
   const players = [];
   const onlineUpdates = []; // minimal lines for updateOnlineStateFromLines compatibility
@@ -565,17 +590,30 @@ async function parseADMFileStream(filePath, logDate, {
   // Territory/emote/respawn/position regexes (subset used)
   const respawnRegex = /^(\d{2}:\d{2}:\d{2}) \| Player "([^"]+)" \(DEAD\) \(id=([A-Za-z0-9_-]+={0,2}) pos=<(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)>\) is choosing to respawn$/;
   const playerListHeader = /^(\d{2}:\d{2}:\d{2}) \| ##### PlayerList log: (\d+) players$/;
+  const playerListEnd = /^\d{2}:\d{2}:\d{2} \| (?:#####|#### PlayerList log end)$/;
   const playerLineRegex = /^(\d{2}:\d{2}:\d{2}) \| Player "([^"]+)" \(id=([A-Za-z0-9_-]+={0,2}) pos=<(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)>\)$/;
   const emoteRegex = /^(\d{2}:\d{2}:\d{2}) \| Player "([^"]+)" \(id=([A-Za-z0-9_-]+={0,2}) pos=<(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)>\) performed (\S+)(?: with (.+))?$/;
 
   // For position snapshot blocks
   let inSnapshot = false;
   let snapshotTimestamp = null;
-  let previousLineTimestamp = null;
+  let snapshotDeclaredPlayers = null;
+  let snapshotPlayers = [];
+  let snapshotPlayerIds = new Set();
+  let snapshotMalformed = false;
+  let previousLineTimestamp = initialPreviousLineTimestamp;
+  let linesRead = 0;
   const recentDamageByParticipants = new Map();
 
   const sourceFile = path.basename(filePath);
-  for await (const streamedLine of streamLogLines(filePath, { fullHistory, rootDir })) {
+  for await (const streamedLine of streamLogLines(filePath, {
+    fullHistory,
+    rootDir,
+    startOffset,
+    endOffsetExclusive,
+    sourceLineBase,
+  })) {
+    linesRead++;
     const { line, sourceLineIndex } = streamedLine;
     const lineTimeMatch = line.match(/^(\d{2}:\d{2}:\d{2}) \|/);
     if (lineTimeMatch) {
@@ -628,7 +666,7 @@ async function parseADMFileStream(filePath, logDate, {
       } else {
         sessionsCompleted.push({ playerGamertag: playerName, platformUserId: normalized, loginAt: null, logoutAt: parseADMTimestamp(timestamp, logDate) });
       }
-      onlineUpdates.push({ type: 'disconnect', platformUserId: normalized });
+      onlineUpdates.push({ type: 'disconnect', platformUserId: normalized, observedAt: logoutAt });
       continue;
     }
 
@@ -637,20 +675,49 @@ async function parseADMFileStream(filePath, logDate, {
     if (headerMatch) {
       inSnapshot = true;
       snapshotTimestamp = parseADMTimestamp(headerMatch[1], logDate);
+      snapshotDeclaredPlayers = Number(headerMatch[2]);
+      snapshotPlayers = [];
+      snapshotPlayerIds = new Set();
+      snapshotMalformed = false;
       continue;
     }
-    if (inSnapshot && /^\d{2}:\d{2}:\d{2} \| #####$/.test(line)) {
+    if (inSnapshot && playerListEnd.test(line)) {
+      if (!snapshotMalformed && snapshotPlayers.length === snapshotDeclaredPlayers) {
+        onlineUpdates.push({
+          type: 'snapshot',
+          observedAt: snapshotTimestamp,
+          players: snapshotPlayers,
+        });
+      } else {
+        onlineUpdates.push({ type: 'snapshot_invalid', observedAt: snapshotTimestamp });
+      }
       inSnapshot = false;
       snapshotTimestamp = null;
+      snapshotDeclaredPlayers = null;
+      snapshotPlayers = [];
+      snapshotPlayerIds = new Set();
+      snapshotMalformed = false;
       continue;
     }
     if (inSnapshot) {
       const pl = line.match(playerLineRegex);
       if (pl) {
         const [, , playerName, playerId, posX, posY, posZ] = pl;
+        const normalized = normalizeDayzPlayerId(playerId, platform);
+        if (!normalized || snapshotPlayerIds.has(normalized)) {
+          snapshotMalformed = true;
+        } else {
+          snapshotPlayerIds.add(normalized);
+          snapshotPlayers.push({
+            playerGamertag: playerName,
+            platformUserId: normalized,
+          });
+        }
         positionSnapshots.push({ timestamp: snapshotTimestamp, playerGamertag: playerName, platformUserId: playerId, posX: parseFloat(posX), posY: parseFloat(posY), posZ: parseFloat(posZ) });
         continue;
       }
+      snapshotMalformed = true;
+      continue;
     }
 
     // Parse damage before the generic health prefix consumes the same line.
@@ -834,8 +901,315 @@ async function parseADMFileStream(filePath, logDate, {
     onlineUpdates,
     disconnectPositions,
     sourceObservedAt: previousLineTimestamp,
+    linesRead,
     ...normalizedEvents,
     sessions: sessionsCompleted
+  };
+}
+
+function findCompleteAdmEndOffset(fd, startOffset, fileSize) {
+  if (fileSize <= startOffset) return startOffset;
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = fileSize;
+  while (position > startOffset) {
+    const chunkStart = Math.max(startOffset, position - buffer.length);
+    const length = position - chunkStart;
+    const bytesRead = fs.readSync(fd, buffer, 0, length, chunkStart);
+    for (let index = bytesRead - 1; index >= 0; index--) {
+      if (buffer[index] === 0x0a) return chunkStart + index + 1;
+    }
+    position = chunkStart;
+  }
+  return startOffset;
+}
+
+function findSafeAdmEndOffset(fd, startOffset, fileSize) {
+  const completeEndOffset = findCompleteAdmEndOffset(fd, startOffset, fileSize);
+  if (completeEndOffset === startOffset) {
+    return { endOffsetExclusive: startOffset, trailingIncompleteSnapshot: false };
+  }
+
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const lineParts = [];
+  const maxMarkerLineBytes = 512;
+  let lineBytes = 0;
+  let lineTooLong = false;
+  let position = startOffset;
+  let lineStartOffset = startOffset;
+  let openSnapshotOffset = null;
+
+  const inspectLine = () => {
+    if (!lineTooLong) {
+      const line = Buffer.concat(lineParts, lineBytes).toString('utf8').replace(/\r$/, '');
+      if (/^\d{2}:\d{2}:\d{2} \| ##### PlayerList log: \d+ players$/.test(line)) {
+        if (openSnapshotOffset === null) openSnapshotOffset = lineStartOffset;
+      } else if (
+        openSnapshotOffset !== null
+        && /^\d{2}:\d{2}:\d{2} \| (?:#####|#### PlayerList log end)$/.test(line)
+      ) {
+        openSnapshotOffset = null;
+      }
+    }
+    lineParts.length = 0;
+    lineBytes = 0;
+    lineTooLong = false;
+  };
+
+  while (position < completeEndOffset) {
+    const length = Math.min(buffer.length, completeEndOffset - position);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, position);
+    if (bytesRead !== length) throw new Error('Unable to inspect complete incremental ADM bytes');
+    let segmentStart = 0;
+    for (let index = 0; index < bytesRead; index++) {
+      if (buffer[index] !== 0x0a) continue;
+      const segment = buffer.subarray(segmentStart, index);
+      if (!lineTooLong && lineBytes + segment.length <= maxMarkerLineBytes) {
+        lineParts.push(Buffer.from(segment));
+        lineBytes += segment.length;
+      } else {
+        lineTooLong = true;
+        lineParts.length = 0;
+        lineBytes = 0;
+      }
+      inspectLine();
+      lineStartOffset = position + index + 1;
+      segmentStart = index + 1;
+    }
+    if (segmentStart < bytesRead) {
+      const segment = buffer.subarray(segmentStart, bytesRead);
+      if (!lineTooLong && lineBytes + segment.length <= maxMarkerLineBytes) {
+        lineParts.push(Buffer.from(segment));
+        lineBytes += segment.length;
+      } else {
+        lineTooLong = true;
+        lineParts.length = 0;
+        lineBytes = 0;
+      }
+    }
+    position += bytesRead;
+  }
+
+  if (openSnapshotOffset === null) {
+    return { endOffsetExclusive: completeEndOffset, trailingIncompleteSnapshot: false };
+  }
+  return {
+    endOffsetExclusive: openSnapshotOffset,
+    trailingIncompleteSnapshot: true,
+  };
+}
+
+function fingerprintAdmPrefix(fd, endOffsetExclusive) {
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (position < endOffsetExclusive) {
+    const length = Math.min(buffer.length, endOffsetExclusive - position);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, position);
+    if (bytesRead !== length) throw new Error('ADM prefix changed while fingerprinting');
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return hash.digest('hex');
+}
+
+async function resolveExactAdmIngestionContext(db, internalServerId, platformServerId, token) {
+  const rows = await db.query(
+    `SELECT s.id, s.platform, s.platform_server_id, g.discord_guild_id, gt.token_hash
+     FROM servers s
+     JOIN guilds g ON g.id = s.guild_id AND g.status = 'approved'
+     JOIN guild_tokens gt ON gt.guild_id = g.id
+       AND gt.token_type = 'nitrado' AND gt.nitrado_user_id IS NOT NULL
+     WHERE s.id = ? AND CAST(s.platform_server_id AS TEXT) = ? AND s.status = 'active'`,
+    [internalServerId, String(platformServerId)]
+  );
+  if (!rows || rows.length !== 1 || decryptToken(rows[0].token_hash) !== token) {
+    throw new Error('Incremental ADM credential or exact-server binding is no longer current');
+  }
+  const platform = normalizeParserPlatform(rows[0].platform);
+  if (!platform) throw new Error('Incremental ADM platform is unavailable');
+  return {
+    id: Number(rows[0].id),
+    guildId: String(rows[0].discord_guild_id),
+    platform,
+  };
+}
+
+async function ingestExactServerAdmFile(
+  db,
+  platformServerId,
+  token,
+  internalServerId,
+  file,
+  priorCursor = null
+) {
+  if (!file || !isSupportedAdmFilename(file.name) || path.basename(file.localPath || '') !== file.name) {
+    throw new Error('Unsupported incremental ADM artifact');
+  }
+  const baseDir = path.dirname(file.localPath);
+  let startOffset = Number(priorCursor?.offset || 0);
+  let sourceLineBase = Number(priorCursor?.sourceLineBase || 0);
+  let previousLineTimestamp = priorCursor?.previousLineTimestamp || null;
+  let opened = openLogFile(file.localPath, baseDir);
+  let { fd, stat } = opened;
+  try {
+    const cursorInvalid = !Number.isSafeInteger(startOffset) || startOffset < 0 || startOffset > stat.size
+      || !Number.isSafeInteger(sourceLineBase) || sourceLineBase < 0
+      || (startOffset > 0 && priorCursor?.fingerprint !== fingerprintAdmPrefix(fd, startOffset));
+    if (cursorInvalid) {
+      startOffset = 0;
+      sourceLineBase = 0;
+      previousLineTimestamp = null;
+    }
+    const {
+      endOffsetExclusive,
+      trailingIncompleteSnapshot,
+    } = findSafeAdmEndOffset(fd, startOffset, stat.size);
+    const nextFingerprint = fingerprintAdmPrefix(fd, endOffsetExclusive);
+    fs.closeSync(fd);
+    fd = null;
+
+    if (endOffsetExclusive === startOffset) {
+      return {
+        killEvents: 0,
+        processedBytes: 0,
+        onlineUpdates: [],
+        sourceFileName: file.name,
+        cursorReset: cursorInvalid,
+        cursor: {
+          offset: startOffset,
+          sourceLineBase,
+          previousLineTimestamp,
+          fingerprint: fingerprintAdmPrefixForEmpty(startOffset, priorCursor, nextFingerprint),
+        },
+      };
+    }
+
+    const initialContext = await resolveExactAdmIngestionContext(
+      db,
+      internalServerId,
+      platformServerId,
+      token
+    );
+    const parsed = await parseADMFileStream(
+      file.localPath,
+      previousLineTimestamp
+        ? new Date(previousLineTimestamp).toISOString().slice(0, 10)
+        : extractLogDateFromFilePath(file.localPath, baseDir),
+      {
+        rootDir: baseDir,
+        includeActiveSessions: false,
+        platform: initialContext.platform,
+        startOffset,
+        endOffsetExclusive,
+        sourceLineBase,
+        initialPreviousLineTimestamp: previousLineTimestamp,
+      }
+    );
+
+    const currentContext = await resolveExactAdmIngestionContext(
+      db,
+      internalServerId,
+      platformServerId,
+      token
+    );
+    if (currentContext.platform !== initialContext.platform || currentContext.guildId !== initialContext.guildId) {
+      throw new Error('Incremental ADM server context changed during parsing');
+    }
+    const killParticipants = [];
+    const participantIds = new Set();
+    const addParticipant = (playerName, platformUserId) => {
+      const normalized = normalizeDayzPlayerId(platformUserId, currentContext.platform);
+      if (!normalized || participantIds.has(normalized)) return;
+      participantIds.add(normalized);
+      killParticipants.push({ playerName, platformUserId: normalized, dpnid: null, deviceId: null });
+    };
+    for (const event of parsed.killEvents || []) {
+      addParticipant(event.killerGamertag, event.killerPlatformUserId);
+      addParticipant(event.victimGamertag, event.victimPlatformUserId);
+    }
+    await savePlayersToDatabase(
+      db,
+      null,
+      platformServerId,
+      killParticipants,
+      currentContext.platform,
+      currentContext.id
+    );
+    const killEvents = await saveKillEvents(
+      db,
+      platformServerId,
+      parsed.killEvents || [],
+      currentContext.platform,
+      currentContext.guildId,
+      currentContext.id
+    );
+    return {
+      killEvents,
+      processedBytes: endOffsetExclusive - startOffset,
+      onlineUpdates: trailingIncompleteSnapshot ? [] : (parsed.onlineUpdates || []),
+      sourceFileName: file.name,
+      cursorReset: cursorInvalid,
+      cursor: {
+        offset: endOffsetExclusive,
+        sourceLineBase: sourceLineBase + Number(parsed.linesRead || 0),
+        previousLineTimestamp: parsed.sourceObservedAt || previousLineTimestamp,
+        fingerprint: nextFingerprint,
+      },
+    };
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function fingerprintAdmPrefixForEmpty(startOffset, priorCursor, computedFingerprint) {
+  return startOffset > 0 && priorCursor?.fingerprint
+    ? priorCursor.fingerprint
+    : computedFingerprint;
+}
+
+async function ingestExactServerAdmFiles(
+  db,
+  platformServerId,
+  token,
+  internalServerId,
+  admFiles,
+  priorCursors = new Map()
+) {
+  if (!Array.isArray(admFiles) || admFiles.length < 1 || admFiles.length > 2 || !(priorCursors instanceof Map)) {
+    throw new Error('Invalid incremental ADM generation set');
+  }
+  const sorted = [...admFiles].sort((left, right) => compareLogFileEntries(
+    { name: left.name, mtimeMs: Date.parse(left.modifiedAt) },
+    { name: right.name, mtimeMs: Date.parse(right.modifiedAt) }
+  ));
+  const cursors = new Map();
+  const onlineUpdates = [];
+  const onlineResetFiles = [];
+  let killEvents = 0;
+  let processedBytes = 0;
+  for (const file of sorted) {
+    const result = await ingestExactServerAdmFile(
+      db,
+      platformServerId,
+      token,
+      internalServerId,
+      file,
+      priorCursors.get(file.name) || null
+    );
+    killEvents += Number(result.killEvents || 0);
+    processedBytes += Number(result.processedBytes || 0);
+    for (const update of result.onlineUpdates || []) {
+      onlineUpdates.push({ ...update, sourceFileName: result.sourceFileName });
+    }
+    if (result.cursorReset) onlineResetFiles.push(result.sourceFileName);
+    cursors.set(file.name, result.cursor);
+  }
+  return {
+    killEvents,
+    processedBytes,
+    cursors,
+    onlineUpdates,
+    onlineResetFiles,
   };
 }
 
@@ -878,55 +1252,167 @@ function parseADMLog(content, platform = null) {
 }
 
 // Parse RPT log for player IDs, dpnids, and device IDs
-function parseRPTLog(content, platform = null) {
-  const lines = toLines(content);
-
-  // Match: Player (id=) has connected.
+function createRPTIdentityCollector(platform = null) {
   const connectedRegex = /Player (\S+) \(id=([A-Za-z0-9_-]+={0,2})\) has connected\./;
-
-  // Match: [Login]: Adding player  to login queue
   const loginRegex = /\[Login\]: Adding (?:prioritized )?player (\S+) \((\d+)\) to login queue/;
-
-  // Match: [MAM] :: [NetworkServer::CheckMAMData] :: device:  | account:
   const deviceRegex = /\[MAM\] :: \[NetworkServer::CheckMAMData\] :: device: ([A-Za-z0-9+/=_-]+) \| account: ([A-Za-z0-9_-]+={0,2})/;
+  const deviceMap = new Map();
+  const dpnidMap = new Map();
+  const connections = [];
 
-  const playerMap = new Map();
-  const deviceMap = new Map(); // platformUserId -> deviceId
-  const dpnidMap = new Map(); // playerName -> dpnid
-
-  // First pass: collect device IDs and dpnids
-  for (const line of lines) {
-    const deviceMatch = line.match(deviceRegex);
-    if (deviceMatch) {
-      const platformUserId = normalizeDayzPlayerId(deviceMatch[2], platform);
-      if (platformUserId) deviceMap.set(platformUserId, deviceMatch[1]);
-    }
-
-    const loginMatch = line.match(loginRegex);
-    if (loginMatch) {
-      dpnidMap.set(loginMatch[1], loginMatch[2]);
-    }
-  }
-
-  // Second pass: build player records
-  for (const line of lines) {
-    const connMatch = line.match(connectedRegex);
-    if (connMatch) {
-      const playerName = connMatch[1];
-      const platformUserId = normalizeDayzPlayerId(connMatch[2], platform);
-
-      if (platformUserId && !playerMap.has(platformUserId)) {
+  return {
+    consume(line) {
+      const deviceMatch = line.match(deviceRegex);
+      if (deviceMatch) {
+        const platformUserId = normalizeDayzPlayerId(deviceMatch[2], platform);
+        if (platformUserId) deviceMap.set(platformUserId, deviceMatch[1]);
+      }
+      const loginMatch = line.match(loginRegex);
+      if (loginMatch) dpnidMap.set(loginMatch[1], loginMatch[2]);
+      const connection = line.match(connectedRegex);
+      if (connection) connections.push({ playerName: connection[1], rawId: connection[2] });
+    },
+    players() {
+      const playerMap = new Map();
+      for (const connection of connections) {
+        const platformUserId = normalizeDayzPlayerId(connection.rawId, platform);
+        if (!platformUserId || playerMap.has(platformUserId)) continue;
         playerMap.set(platformUserId, {
-          playerName,
+          playerName: connection.playerName,
           platformUserId,
-          dpnid: dpnidMap.get(playerName) || null,
-          deviceId: deviceMap.get(platformUserId) || null
+          dpnid: dpnidMap.get(connection.playerName) || null,
+          deviceId: deviceMap.get(platformUserId) || null,
         });
       }
-    }
+      return Array.from(playerMap.values());
+    },
+  };
+}
+
+function parseRPTLog(content, platform = null) {
+  const collector = createRPTIdentityCollector(platform);
+  for (const line of toLines(content)) collector.consume(line);
+  return collector.players();
+}
+
+function parseRPTClockTimestamp(timeText, logDate, chronology) {
+  return parseSharedRptClockTimestamp(timeText, logDate, chronology);
+}
+
+const RPT_LINE_TIMESTAMP_REGEX = /^\s*(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)/;
+const RPT_LOGIN_QUEUE_REGEX = /\[Login\]: Adding (?:prioritized )?player (.+?) \((\d+)\) to login queue/;
+const RPT_LOGIN_WAIT_REGEX = /\[StateMachine\]: Player (.+?) \(dpnid (\d+) uid ([^)]*)\) Entering DBWaitLoginTimeLoginState/;
+const RPT_LOGIN_WAIT_EXIT_REGEX = /\[StateMachine\]: Player (.+?) \(dpnid (\d+) uid ([^)]*)\) Entering DBGetCharacterLoginState/;
+
+function createRPTLoginWaitState(logDate, platform, sourceFile) {
+  return {
+    logDate,
+    platform,
+    sourceFile,
+    chronology: { dayOffset: 0, previousMs: null },
+    queuedByDpnid: new Map(),
+    waitingByDpnid: new Map(),
+    events: [],
+  };
+}
+
+function consumeRPTLoginWaitLine(state, line, sourceLine) {
+  const timestampMatch = line.match(RPT_LINE_TIMESTAMP_REGEX);
+  if (!timestampMatch) return;
+  const timestampMs = parseRPTClockTimestamp(timestampMatch[1], state.logDate, state.chronology);
+  if (timestampMs === null) return;
+
+  const queueMatch = line.match(RPT_LOGIN_QUEUE_REGEX);
+  if (queueMatch) {
+    state.queuedByDpnid.set(queueMatch[2], {
+      playerGamertag: queueMatch[1].trim(),
+      queueEnteredAt: new Date(timestampMs).toISOString(),
+    });
+    state.waitingByDpnid.delete(queueMatch[2]);
+    return;
   }
 
-  return Array.from(playerMap.values());
+  const waitMatch = line.match(RPT_LOGIN_WAIT_REGEX);
+  if (waitMatch) {
+    const platformUserId = normalizeDayzPlayerId(waitMatch[3].trim(), state.platform);
+    if (!platformUserId) return;
+    const queued = state.queuedByDpnid.get(waitMatch[2]);
+    state.waitingByDpnid.set(waitMatch[2], {
+      playerGamertag: waitMatch[1].trim(),
+      platformUserId,
+      queueEnteredAt: queued?.queueEnteredAt || null,
+      waitStartedAt: new Date(timestampMs).toISOString(),
+      waitStartedMs: timestampMs,
+      sourceLine,
+    });
+    return;
+  }
+
+  const exitMatch = line.match(RPT_LOGIN_WAIT_EXIT_REGEX);
+  if (!exitMatch) return;
+  const waiting = state.waitingByDpnid.get(exitMatch[2]);
+  const platformUserId = normalizeDayzPlayerId(exitMatch[3].trim(), state.platform);
+  if (!waiting || !platformUserId || platformUserId !== waiting.platformUserId
+      || timestampMs < waiting.waitStartedMs) {
+    return;
+  }
+  state.events.push({
+    playerGamertag: waiting.playerGamertag,
+    platformUserId: waiting.platformUserId,
+    queueEnteredAt: waiting.queueEnteredAt,
+    waitStartedAt: waiting.waitStartedAt,
+    waitEndedAt: new Date(timestampMs).toISOString(),
+    waitDurationMs: timestampMs - waiting.waitStartedMs,
+    sourceFile: state.sourceFile,
+    sourceLine: waiting.sourceLine,
+  });
+  state.waitingByDpnid.delete(exitMatch[2]);
+}
+
+function parseRPTLoginWaits(content, logDate, platform = null, sourceFile = null) {
+  const state = createRPTLoginWaitState(logDate, platform, sourceFile);
+  const lines = toLines(content);
+  for (let index = 0; index < lines.length; index++) {
+    consumeRPTLoginWaitLine(state, lines[index], index + 1);
+  }
+  return state.events;
+}
+
+async function parseRPTFileObservations(filePath, logDate, platform = null, {
+  rootDir = path.dirname(filePath),
+} = {}) {
+  const relativeSource = path.relative(rootDir, filePath);
+  if (!relativeSource || path.isAbsolute(relativeSource)
+      || relativeSource === '..' || relativeSource.startsWith(`..${path.sep}`)) {
+    throw new Error('RPT source file must remain inside the authorized log directory');
+  }
+  const sourceFile = relativeSource.split(path.sep).join('/');
+  const waitState = createRPTLoginWaitState(logDate, platform, sourceFile);
+  const telemetry = createRptTelemetryCollector({ logDate, sourceFile });
+  const identities = createRPTIdentityCollector(platform);
+  const cleanups = createCleanupCollector(logDate);
+  for await (const { line, sourceLineIndex } of streamLogLines(filePath, {
+    fullHistory: true,
+    rootDir,
+  })) {
+    const sourceLine = sourceLineIndex + 1;
+    identities.consume(line);
+    cleanups.consume(line);
+    consumeRPTLoginWaitLine(waitState, line, sourceLine);
+    telemetry.consume(line, sourceLine);
+  }
+  return {
+    sourceFile,
+    players: identities.players(),
+    cleanups: cleanups.events,
+    loginWaits: waitState.events,
+    telemetryEvents: telemetry.events,
+  };
+}
+
+async function parseRPTLoginWaitFile(filePath, logDate, platform = null, options = {}) {
+  const observations = await parseRPTFileObservations(filePath, logDate, platform, options);
+  return observations.loginWaits;
 }
 
 /**
@@ -1017,7 +1503,7 @@ function parseADMTimestamp(timeStr, logDate, previousTimestamp = null) {
  * cursor. Reusing those timestamps avoids dating post-midnight connections
  * against the file's original start date.
  *
- * @param {object[]} updates - Parser-resolved connect/disconnect updates
+ * @param {object[]} updates - Parser-resolved connect/disconnect/snapshot updates
  * @param {Map} onlineMap - Map<platformUserId, session> mutated in place
  */
 function updateOnlineState(updates, onlineMap) {
@@ -1030,6 +1516,16 @@ function updateOnlineState(updates, onlineMap) {
       });
     } else if (update.type === 'disconnect') {
       onlineMap.delete(update.platformUserId);
+    } else if (update.type === 'snapshot') {
+      const prior = new Map(onlineMap);
+      onlineMap.clear();
+      for (const player of update.players) {
+        onlineMap.set(player.platformUserId, {
+          playerGamertag: player.playerGamertag,
+          platformUserId: player.platformUserId,
+          loginAt: prior.get(player.platformUserId)?.loginAt || null,
+        });
+      }
     }
   }
 }
@@ -1216,13 +1712,8 @@ async function updateOnlineCache(db, platformServerId, activeSessions, platform,
         const identityId = resolvedIdentityId(
           identityMap, session.platformUserId, 'Online cache participant'
         );
-        let gamertag = session.playerGamertag || session.platformUserId;
-        const gtagRow = await transactionDb.get(
-          `SELECT gamertag FROM player_gamertags
-           WHERE identity_id = ? AND server_id = ? AND is_current_gamertag = 1 LIMIT 1`,
-          [identityId, dbServerId]
-        );
-        gamertag = gtagRow?.gamertag || gamertag;
+        const gamertag = String(session.playerGamertag || '').trim();
+        if (!gamertag) continue;
 
         await transactionDb.run(
           `INSERT INTO server_online_cache (server_id, identity_id, gamertag, login_at, updated_at)
@@ -1253,6 +1744,50 @@ async function updateOnlineCache(db, platformServerId, activeSessions, platform,
     console.error(`  ⚠️  updateOnlineCache error:`, err.message);
     throw err;
   }
+}
+
+async function publishExactServerOnlineSnapshot(
+  db,
+  platformServerId,
+  token,
+  internalServerId,
+  snapshot,
+  sourceObservedAt,
+  {
+    resolveContext = resolveExactAdmIngestionContext,
+    savePlayers = savePlayersToDatabase,
+    allocateGeneration = allocateOnlineCacheScanGeneration,
+    updateCache = updateOnlineCache,
+  } = {}
+) {
+  if (!snapshot || !Array.isArray(snapshot.players)) {
+    throw new Error('Incremental online snapshot is invalid');
+  }
+  const context = await resolveContext(db, internalServerId, platformServerId, token);
+  const players = snapshot.players.map(player => ({
+    playerName: player.playerGamertag,
+    platformUserId: player.platformUserId,
+    dpnid: null,
+    deviceId: null,
+  }));
+  await savePlayers(
+    db,
+    null,
+    platformServerId,
+    players,
+    context.platform,
+    context.id
+  );
+  const scanGeneration = await allocateGeneration(db);
+  return updateCache(
+    db,
+    platformServerId,
+    snapshot.players,
+    context.platform,
+    context.id,
+    sourceObservedAt,
+    scanGeneration
+  );
 }
 
 /**
@@ -2662,25 +3197,69 @@ async function saveUnconsciousEvents(db, platformServerId, events, platform, int
  * @param {string}          logDate    - ISO date string extracted from the filename (YYYY-MM-DD)
  * @returns {{ itemClass, posX, posZ, damage, logDate }[]}
  */
-function parseCleanupEvents(rptContent, logDate) {
-  const lines = toLines(rptContent);
+function createCleanupCollector(logDate) {
   const events = [];
-
-  // HH:MM:SS[.mmm]  <cleanup> Depleted:"ItemClass" at [x,z] damage=N.NN [DE="group"]
   const regex = /\d{1,2}:\d{2}:\d{2}[\d.]* <cleanup> Depleted:"([^"]+)" at \[(\d+),(\d+)\] damage=([\d.]+)/;
+  return {
+    events,
+    consume(line) {
+      const match = line.match(regex);
+      if (!match) return;
+      events.push({
+        itemClass: match[1],
+        posX: parseInt(match[2], 10),
+        posZ: parseInt(match[3], 10),
+        damage: parseFloat(match[4]),
+        logDate,
+      });
+    },
+  };
+}
 
-  for (const line of lines) {
-    const m = line.match(regex);
-    if (!m) continue;
-    events.push({
-      itemClass: m[1],
-      posX:      parseInt(m[2], 10),
-      posZ:      parseInt(m[3], 10),
-      damage:    parseFloat(m[4]),
-      logDate,
+function parseCleanupEvents(rptContent, logDate) {
+  const collector = createCleanupCollector(logDate);
+  for (const line of toLines(rptContent)) collector.consume(line);
+  return collector.events;
+}
+
+async function saveRPTLoginWaitEvents(db, platformServerId, events, platform, internalServerId) {
+  if (!events || events.length === 0) return 0;
+  const server = await getExactServerForPersistence(db, platformServerId, internalServerId);
+  const dbServerId = server.id;
+  const identityMap = await buildIdentityMap(db, platform, events.map(event => event.platformUserId));
+  const rows = events.map(event => ({
+    ...event,
+    identityId: resolvedIdentityId(identityMap, event.platformUserId, 'RPT login wait'),
+  }));
+  let savedCount = 0;
+  const batchSize = 250;
+  for (let index = 0; index < rows.length; index += batchSize) {
+    const batch = rows.slice(index, index + batchSize);
+    const values = [];
+    const placeholders = batch.map((event, batchIndex) => {
+      const offset = batchIndex * 7;
+      values.push(
+        dbServerId,
+        event.identityId,
+        event.queueEnteredAt,
+        event.waitStartedAt,
+        event.waitEndedAt,
+        event.sourceFile,
+        event.sourceLine
+      );
+      return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`;
     });
+    const result = await db.run(
+      `INSERT INTO rpt_login_wait_events (
+         server_id, identity_id, queue_entered_at, wait_started_at, wait_ended_at,
+         source_file, source_line
+       ) VALUES ${placeholders.join(', ')}
+       ON CONFLICT (server_id, source_file, source_line) DO NOTHING`,
+      values
+    );
+    savedCount += result.changes ?? 0;
   }
-  return events;
+  return savedCount;
 }
 
 /**
@@ -2746,6 +3325,14 @@ function extractRPTLogDate(filePath, rootDir = path.dirname(filePath)) {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function extractRPTTelemetryLogDate(filePath) {
+  const filename = path.basename(filePath);
+  if (!isSupportedRptFilename(filename)) {
+    throw new Error(`RPT telemetry requires a supported timestamped filename: ${filename}`);
+  }
+  return new Date(logStartTimeMs(filename)).toISOString().slice(0, 10);
 }
 
 /**
@@ -3253,6 +3840,7 @@ async function scanLogsForServer(db, userId, serverId, token, {
   systemAuthorizedInternalServerId = null,
   sourceObservedAt = null,
   sourceObservedLogFile = null,
+  ingestionLockHeld = false,
 } = {}) {
   let guildDiscordId;
   let serverContext;
@@ -3309,6 +3897,28 @@ async function scanLogsForServer(db, userId, serverId, token, {
     throw new Error(`Unable to resolve exact server context for ${serverId}`);
   }
 
+  if (!ingestionLockHeld) {
+    const ingestionLock = await acquireExactServerLogLocks(db, [serverContext.id]);
+    if (!ingestionLock) {
+      const error = new Error(`Log ingestion is already active for exact server ${serverContext.id}`);
+      error.status = 409;
+      throw error;
+    }
+    try {
+      return await scanLogsForServer(db, userId, serverId, token, {
+        fullHistory,
+        includeRptLogs,
+        internalServerId: serverContext.id,
+        systemAuthorizedInternalServerId,
+        sourceObservedAt,
+        sourceObservedLogFile,
+        ingestionLockHeld: true,
+      });
+    } finally {
+      await ingestionLock.release();
+    }
+  }
+
   // Allocation precedes scan work. Failed/partial scans consume a generation
   // without publishing it and therefore cannot renew cache authority.
   const scanGeneration = await allocateOnlineCacheScanGeneration(db);
@@ -3356,6 +3966,7 @@ async function scanLogsForServer(db, userId, serverId, token, {
   const failedLogFiles = [];
   let totalKillsSaved = 0;
   let latestSourceObservedAt = null;
+  const allLoginWaitEvents = [];
 
   // Tracks current online state across ALL ADM files in chronological order.
   // Connect events add a player; disconnect events remove them.
@@ -3450,40 +4061,50 @@ async function scanLogsForServer(db, userId, serverId, token, {
     }
   }
 
-  // Parse RPT logs: extract players AND cleanup (despawn) events and save them
+  // Parse RPT logs: extract players, account waits, CE telemetry, and cleanup events.
   let totalCleanupSaved = 0;
+  let totalTelemetrySaved = 0;
+  let totalTelemetryRetired = 0;
   for (const logPath of allRptLogs) {
     try {
-      let rptLog = readLogFileSafely(logPath, { fullHistory, rootDir: baseDir });
-      const rptLines = rptLog.split('\n'); // split once; pass array to parseRPTLog
-      rptLog = null; // free the raw string before iterating
+      const rptDate = extractRPTTelemetryLogDate(logPath, baseDir);
+      const observations = await parseRPTFileObservations(logPath, rptDate, platform, { rootDir: baseDir });
 
-      // Merge player identity info from RPT
-      parseRPTLog(rptLines, platform).forEach(player => {
+      for (const player of observations.players) {
         const key = (player.playerName || player.platformUserId || '').toLowerCase();
         if (playerMap.has(key)) {
           playerMap.get(key).deviceId = player.deviceId || playerMap.get(key).deviceId;
         } else {
           playerMap.set(key, player);
         }
-      });
-
-      // Parse cleanup/despawn events and persist them so loot despawn pipeline is populated
-      try {
-        const rptDate = extractRPTLogDate(logPath, baseDir);
-        const cleanups = parseCleanupEvents(rptLines, rptDate);
-        if (cleanups && cleanups.length > 0) {
-          const saved = await saveCleanupEvents(db, serverId, cleanups, serverContext.id);
-          totalCleanupSaved += saved || 0;
-          console.log(`  ✓ ${path.basename(logPath)}: ${cleanups.length} cleanup events (${saved} new)`);
-        }
-      } catch (cleanupErr) {
-        console.error(`  ❌ Error parsing/saving cleanup events for ${logPath}:`, cleanupErr.message);
-        failedLogFiles.push(path.basename(logPath));
       }
-
+      for (const event of observations.loginWaits) {
+        allLoginWaitEvents.push(event);
+        const key = (event.playerGamertag || event.platformUserId).toLowerCase();
+        if (!playerMap.has(key)) {
+          playerMap.set(key, {
+            playerName: event.playerGamertag,
+            platformUserId: event.platformUserId,
+            dpnid: null,
+            deviceId: null,
+          });
+        }
+      }
+      const telemetryResult = await replaceRptTelemetryEvents(
+        db,
+        serverContext.id,
+        observations.sourceFile,
+        observations.telemetryEvents
+      );
+      totalTelemetrySaved += telemetryResult.written;
+      totalTelemetryRetired += telemetryResult.retired;
+      if (observations.cleanups.length > 0) {
+        const saved = await saveCleanupEvents(db, serverId, observations.cleanups, serverContext.id);
+        totalCleanupSaved += saved || 0;
+        console.log(`  ✓ ${path.basename(logPath)}: ${observations.cleanups.length} cleanup events (${saved} new)`);
+      }
     } catch (err) {
-      console.error(`  ❌ Error reading ${logPath}:`, err.message);
+      console.error(`  ❌ Error reading/parsing ${logPath}:`, err.message);
       failedLogFiles.push(path.basename(logPath));
     }
   }
@@ -3494,9 +4115,12 @@ async function scanLogsForServer(db, userId, serverId, token, {
 
   const players = Array.from(playerMap.values());
   if (totalCleanupSaved > 0) console.log(`  ✅ Saved ${totalCleanupSaved} total cleanup events for server ${serverId}`);
+  if (totalTelemetrySaved > 0) console.log(`  ✅ Wrote ${totalTelemetrySaved} RPT telemetry events for server ${serverId}`);
+  if (totalTelemetryRetired > 0) console.log(`  🗃️ Retired ${totalTelemetryRetired} stale RPT telemetry events for server ${serverId}`);
   const allHealthUpdates = Array.from(healthUpdatesMap.values());
 
   await savePlayersToDatabase(db, userId, serverId, players, platform, serverContext.id);
+  await saveRPTLoginWaitEvents(db, serverId, allLoginWaitEvents, platform, serverContext.id);
   await refreshPlayerServerActivity(db, serverId, serverContext.id);
   await saveHealthUpdates(db, serverId, allHealthUpdates, platform, serverContext.id);
 
@@ -3531,6 +4155,8 @@ async function scanLogsForServer(db, userId, serverId, token, {
     players: players.length,
     totalPlayers: players.length,
     killEvents: totalKillsSaved,
+    rptTelemetryEvents: totalTelemetrySaved,
+    rptTelemetryEventsRetired: totalTelemetryRetired,
     onlineCachePublished,
     filesScanned: { admCount: allAdmLogs.length, rptCount: allRptLogs.length }
   };
@@ -3540,6 +4166,7 @@ module.exports = router;
 module.exports.scanLogsForServer = scanLogsForServer;
 module.exports.allocateOnlineCacheScanGeneration = allocateOnlineCacheScanGeneration;
 module.exports.updateOnlineCache = updateOnlineCache;
+module.exports.publishExactServerOnlineSnapshot = publishExactServerOnlineSnapshot;
 module.exports.normalizeSourceObservedAt = normalizeSourceObservedAt;
 module.exports.normalizeLatestAdmPositionTimestamps = normalizeLatestAdmPositionTimestamps;
 module.exports.findLogFile = findLogFile;
@@ -3548,7 +4175,15 @@ module.exports.streamLogLines = streamLogLines;
 module.exports.extractLogDateFromFilePath = extractLogDateFromFilePath;
 module.exports.extractRPTLogDate = extractRPTLogDate;
 module.exports.parseADMLog = parseADMLog;
+module.exports.parseRPTLog = parseRPTLog;
+module.exports.parseRPTFileObservations = parseRPTFileObservations;
+module.exports.extractRPTLogDate = extractRPTLogDate;
+module.exports.extractRPTTelemetryLogDate = extractRPTTelemetryLogDate;
+module.exports.parseRPTLoginWaitFile = parseRPTLoginWaitFile;
+module.exports.parseRPTLoginWaits = parseRPTLoginWaits;
 module.exports.parseADMFileStream = parseADMFileStream;
+module.exports.updateOnlineState = updateOnlineState;
+module.exports.ingestExactServerAdmFiles = ingestExactServerAdmFiles;
 module.exports.normalizeParsedEventIdentities = normalizeParsedEventIdentities;
 module.exports.resolveServerPlatform = resolveServerPlatform;
 module.exports.parseCombatEvents = parseCombatEvents;
@@ -3556,6 +4191,7 @@ module.exports.saveKillEvents = saveKillEvents;
 module.exports.saveDisconnectPositions = saveDisconnectPositions;
 module.exports.saveSessions = saveSessions;
 module.exports.saveCleanupEvents = saveCleanupEvents;
+module.exports.saveRPTLoginWaitEvents = saveRPTLoginWaitEvents;
 module.exports.savePositionSnapshots = savePositionSnapshots;
 module.exports.saveDamageEvents = saveDamageEvents;
 module.exports.saveTerritoryEvents = saveTerritoryEvents;

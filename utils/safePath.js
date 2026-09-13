@@ -197,7 +197,7 @@ function openContainedFileSync(root, untrustedPath) {
   try {
     fileFd = fs.openSync(
       `${descriptorPath(parentFd)}/${path.basename(candidate)}`,
-      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
     );
     const stat = fs.fstatSync(fileFd);
     if (!stat.isFile()) throw new Error('Invalid file path');

@@ -84,9 +84,9 @@ async function testDiscordSetupQualification() {
             members: { fetch: async memberOptions => {
               fetched.push(memberOptions);
               if (memberOptions.user === 'owner-2') {
-                return { user: { id: 'owner-2', username: 'Owner', avatar: 'avatar' } };
+                return { guild: { id: 'guild-1' }, user: { id: 'owner-2', username: 'Owner', avatar: 'avatar' } };
               }
-              return { user: { id: 'user-1' }, permissions: { has: () => true } };
+              return { guild: { id: 'guild-1' }, user: { id: 'user-1' }, permissions: { has: () => true } };
             } },
           };
         },
@@ -125,10 +125,13 @@ async function testDiscordSetupQualification() {
   const ownerUserId = await ensureAuthoritativeInitialGuildOwner(ownerClient, {
     guildId: 10,
     actorUserId: 11,
+    ownerUserId: 77,
     owner: permission.authoritativeOwner,
     assignIfMissing: true,
   });
   assert.equal(ownerUserId, 77);
+  assert(!ownerQueries.some(entry => /(?:INSERT INTO|UPDATE) users/.test(entry.sql)),
+    'owner assignment must consume the prelocked account, not write users under a tenant lock');
   const roleUpsert = ownerQueries.find(entry => entry.sql.includes('INSERT INTO guild_roles'));
   assert(roleUpsert.sql.includes('ON CONFLICT (guild_id, user_id) DO UPDATE SET'),
     'an existing admin role for the Discord owner must be promoted rather than ignored');
@@ -358,9 +361,10 @@ function testRequiredSecurityContractsExist() {
   assert(registerToken.includes("if (guildStatus === 'pending' || ownerlessGuild)"),
     'approved guilds with an in-progress ownerless setup cannot recover through authoritative token registration');
   assert(registerToken.includes("action, result"), 'initial setup does not create a security audit event');
+  const setupProgressionStart = registerToken.indexOf('INSERT INTO guild_setup_state', registerToken.indexOf('// Bootstrap only an ownerless guild'));
   const setupProgression = registerToken.slice(
-    registerToken.indexOf('INSERT INTO guild_setup_state', registerToken.indexOf('// Bootstrap only an ownerless guild')),
-    registerToken.indexOf('INSERT INTO security_audit_events')
+    setupProgressionStart,
+    registerToken.indexOf('INSERT INTO security_audit_events', setupProgressionStart)
   );
   assert(setupProgression.includes('ON CONFLICT (guild_id) DO UPDATE SET') &&
     setupProgression.includes('current_step = EXCLUDED.current_step') &&

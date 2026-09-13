@@ -39,7 +39,7 @@ function loadGuilds() {
             ? `<img src="${esc(guild.icon_url)}" alt="" class="w-10 h-10 rounded-full">`
             : `<div class="w-10 h-10 rounded-full bg-gray-600 flex items-center justify-center text-xl">${esc(guildName[0] || '?')}</div>`;
           return `<tr class="border-b border-gray-700"><td class="p-3"><div class="flex items-center gap-3">${icon}<div><div class="font-semibold">${esc(guildName)}</div><div class="text-xs text-gray-400">${esc(guildId)}</div></div></div></td>
-            <td class="p-3">${esc(guild.addedByUsername || 'Unknown')}</td>
+            <td class="p-3">${esc(guild.addedByUsername || 'Owner details unavailable — complete /register-token or review ownership')}</td>
             <td class="p-3 text-sm text-gray-400">${esc(guild.addedAt ? new Date(guild.addedAt).toLocaleDateString() : '-')}</td>
             <td class="p-3 text-center"><span class="bg-blue-900 px-3 py-1 rounded-full text-sm">${Number(guild.serverCount) || 0}</span></td>
             <td class="p-3 text-center"><span class="bg-green-900 px-3 py-1 rounded-full text-sm" id="player-count-${esc(guildId)}">…</span></td>

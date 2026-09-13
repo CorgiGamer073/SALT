@@ -433,6 +433,7 @@
                     📁 Files
                     <button id="refreshFilesBtn" style="background: transparent; border: none; cursor: pointer; font-size: 18px;" title="Refresh file list">🔄</button>
                 </h3>
+                <p id="fileListStatus" style="padding: 0 10px; font-size: 12px;"></p>
                 <div id="fileTree" class="file-tree">
                     <div class="loading">
                         <div class="spinner"></div>
@@ -446,11 +447,12 @@
                     <button id="saveBtn" disabled>
                         💾 Save
                     </button>
+                    <button id="doctorBtn" class="btn-info" disabled>🩺 Inspect Draft</button>
                     <button id="formatBtn" class="btn-info" disabled>
                         ✨ Format / Lint
                     </button>
                     <button id="reloadBtn" class="btn-warning" disabled>
-                        🔄 Reload from Server
+                        🔄 Reload Working Copy
                     </button>
                     <button id="backupBtn" disabled>
                         📂 View Backups
@@ -468,6 +470,12 @@
                     <span>📄</span>
                     <span id="fileInfoText">No file selected</span>
                 </div>
+
+                <section aria-label="Mission Doctor Lite" style="padding: 10px 15px; border-bottom: 1px solid #ddd;">
+                    <p id="doctorSource">Select a synchronized file for report-only inspection.</p>
+                    <p>Mission Doctor Lite checks supported rules only. It never saves, uploads, or restarts. For observed events, use <a href="/map">Map → Event Health</a> and select the same server.</p>
+                    <pre id="doctorReport" hidden aria-live="polite" style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto;"></pre>
+                </section>
 
                 <div class="editor-container">
                     <textarea id="editor" placeholder="Select a file from the list to begin editing..."></textarea>
@@ -488,13 +496,13 @@
     <div class="conflict-modal" id="conflictModal">
         <div class="conflict-content">
             <h2>⚠️ Conflict Detected</h2>
-            <p>The file has been modified on the server since you started editing. What would you like to do?</p>
+            <p>The local working copy changed since you loaded it. Save also checks the provider separately; this dialog does not prove provider freshness. What would you like to do?</p>
             <div class="conflict-buttons">
                 <button id="conflictOverwriteBtn" data-action="overwrite" style="background: #dc3545; color: white;">
-                    Overwrite Server Version
+                    Save Against This Working Copy Hash
                 </button>
                 <button id="conflictReloadBtn" data-action="reload" style="background: #28a745; color: white;">
-                    Reload Server Version
+                    Reload Working Copy
                 </button>
                 <button id="conflictCancelBtn" data-action="cancel" style="background: #6c757d; color: white;">
                     Cancel
@@ -505,6 +513,7 @@
 
     <script src="/js/api.js"></script>
     <script src="/js/csrf-helper.js"></script>
+    <script src="/js/mission-doctor.js"></script>
     <script src="/js/mission-editor.js"></script>
 </body>
 </html>

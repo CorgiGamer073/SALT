@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const missionFileService = require('../services/missionFileService');
+const { discoverWorkingCopyFiles, readWorkingCopyFile } = require('../services/missionFileInspectionService');
 const { saveMissionFileVerified } = require('../services/missionEditorSaveService');
 const nitradoService = require('../services/nitradoService');
 const crypto = require('crypto');
@@ -16,7 +17,6 @@ const {
   resolveContainedPath,
   resolveExistingContainedPath,
   resolveWritableContainedPath,
-  statContainedFileSync,
   writeContainedFileAtomicSync,
   writeContainedFileSync,
 } = require('../utils/safePath');
@@ -268,81 +268,23 @@ router.get('/mission-files/list/:serverId?', ensureAuthenticated, async (req, re
     // If server ID provided, scan that server's files
     if (!await requireServerFileAccess(req, res, serverId)) return;
 
-    const { serverRoot: downloadPath, triedRoots } = await resolveServerDownloadRoot(req.app.locals.db, req.user, serverId);
-
-    console.log('   📂 Scanning local path:', downloadPath);
-
+    const { serverRoot: downloadPath } = await resolveServerDownloadRoot(req.app.locals.db, req.user, serverId);
     if (!downloadPath) {
-      return res.json({
-        success: false,
-        error: 'No files downloaded yet. Please use the "Sync Files" button on the dashboard first.',
-        debug: { serverId, triedRoots }
-      });
+      return res.json({ success: false, error: 'No files downloaded yet. Please sync files first.' });
     }
-
-    // Recursively scan for XML/JSON files. Every directory and file is
-    // reopened through descriptor-anchored helpers to reject symlink swaps.
-    const editableFiles = {};
-
-    const scanDirectory = (relativeDir = '.', prefix = '') => {
-      const entries = listContainedDirectorySync(downloadPath, relativeDir);
-
-      for (const entry of entries) {
-        const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
-        const containedPath = relativeDir === '.'
-          ? entry.name
-          : path.join(relativeDir, entry.name);
-
-        if (entry.isDirectory()) {
-          const dirName = entry.name.toLowerCase();
-          if (['custom', 'db', 'env', 'pra', '.git', 'node_modules'].includes(dirName)) {
-            continue;
-          }
-          scanDirectory(containedPath, relativePath);
-        } else if (entry.isFile()) {
-          const fileName = entry.name.toLowerCase();
-          const isXml = fileName.endsWith('.xml');
-          const isJson = fileName.endsWith('.json');
-
-          if (fileName.startsWith('.') || (!isXml && !isJson)) continue;
-          const stats = statContainedFileSync(downloadPath, containedPath);
-          editableFiles[relativePath] = {
-            description: `Mission file: ${relativePath}`,
-            type: isXml ? 'xml' : 'json',
-            path: relativePath,
-            relativePath,
-            size: stats.size
-          };
-        }
-      }
-    };
-
-    try {
-      scanDirectory();
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        console.log('   ❌ Download directory not found');
-        return res.json({
-          success: false,
-          error: 'No files downloaded yet. Please use the "Sync Files" button on the dashboard first.',
-          debug: { serverId, triedRoots }
-        });
-      }
-      throw err;
-    }
-
-    console.log(`   ✅ Found ${Object.keys(editableFiles).length} editable files`);
-
+    const discovery = discoverWorkingCopyFiles(downloadPath);
     res.json({
       success: true,
-      files: editableFiles,
+      ...discovery,
       isLocal: true,
-      downloadPath: downloadPath
+      // Retain the legacy key without exposing an absolute host path.
+      downloadPath: null,
     });
-
   } catch (error) {
-    console.error('Error listing mission files:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    if (error.code === 'ENOENT') {
+      return res.json({ success: false, error: 'No files downloaded yet. Please sync files first.' });
+    }
+    res.status(500).json({ success: false, error: 'Working-copy files could not be safely listed' });
   }
 });
 
@@ -686,58 +628,30 @@ router.put('/mission-files/:serverId/:fileName(*)', ensureAuthenticated, async (
   }
 });
 
-// Read a mission file (CATCH-ALL - must be LAST)
+// Read raw XML/JSON for repair (CATCH-ALL - must be LAST).
+// This is local working-copy evidence, never a provider/deployment type decision.
 router.get('/mission-files/:serverId/:fileName(*)', ensureAuthenticated, async (req, res) => {
   const { serverId, fileName } = req.params;
-
-  console.log('📖 Reading file:', fileName, 'from server:', serverId);
-
   try {
     if (!await requireServerFileAccess(req, res, serverId)) return;
-
-    const { filePath, serverRoot } = await resolveMissionFilePath(req.app.locals.db, req.user, serverId, fileName);
-    if (!filePath) {
-      return res.status(404).json({ success: false, error: 'File not found. Please sync files first.' });
+    const { triedRoots } = await resolveServerDownloadRoot(req.app.locals.db, req.user, serverId);
+    for (const root of triedRoots) {
+      try {
+        const result = readWorkingCopyFile(root, fileName);
+        return res.json({ success: true, ...result });
+      } catch (error) {
+        // Legacy-root fallback is only for absence, never unsafe content/paths.
+        if (error.code !== 'ENOENT') throw error;
+      }
     }
-
-    console.log('   📂 Local path:', filePath);
-
-    const content = readContainedFileSync(
-      serverRoot,
-      path.relative(serverRoot, filePath),
-      'utf8'
-    );
-
-    // Calculate hash
-    const hash = crypto.createHash('sha256').update(content).digest('hex');
-
-    // Parse XML if needed
-    let parsedData = null;
-    if (fileName.toLowerCase().endsWith('.xml')) {
-      const xml2js = require('xml2js');
-      const parser = new xml2js.Parser();
-      parsedData = await parser.parseStringPromise(content);
-    }
-
-    console.log('   ✅ File read successfully, hash:', hash.substring(0, 16) + '...');
-
-    res.json({
-      success: true,
-      fileName,
-      content,
-      parsedData,
-      hash,
-      filePath: fileName,
-      isLocal: true
-    });
-
+    res.status(404).json({ success: false, error: 'File not found. Please sync files first.' });
   } catch (error) {
-    console.error('Error reading file:', error.message);
-    if (error.code === 'ENOENT') {
-      res.status(404).json({ success: false, error: 'File not found. Please sync files first.' });
-    } else {
-      res.status(500).json({ success: false, error: error.message });
-    }
+    const status = error.status || 500;
+    res.status(status).json({
+      success: false,
+      error: status < 500 ? error.message : 'Working copy could not be safely read',
+      ...(error.status && error.code ? { code: error.code } : {}),
+    });
   }
 });
 
