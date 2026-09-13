@@ -206,6 +206,90 @@ async function testOnlinePlayerEvidenceIsExactServerRestartScopedAndCountMatched
   assert.strictEqual(zeroCountQueries, 0, 'zero-player servers must return empty before reading stale names');
 }
 
+async function testPcOnlinePlayersUseAuthoritativeProviderList() {
+  let databaseQueries = 0;
+  const queryPool = {
+    query: async () => {
+      databaseQueries += 1;
+      return { rows: [] };
+    },
+  };
+  const calls = [];
+  const playerService = {
+    listPlayers: async (token, serviceId) => {
+      calls.push({ token, serviceId });
+      return [
+        { id: 'steam-1', name: 'Current One', online: true },
+        { id: 'steam-2', name: 'Current Two', online: true },
+        { id: 'steam-3', name: 'Offline Player', online: false },
+      ];
+    },
+  };
+
+  const players = await fetchOnlinePlayers(50, '9001', 2, null, queryPool, {
+    platform: 'pc',
+    token: 'test-token',
+    playerService,
+  });
+  assert.deepStrictEqual(calls, [{ token: 'test-token', serviceId: '9001' }]);
+  assert.strictEqual(databaseQueries, 0, 'PC names must not depend on the ADM cache');
+  assert.deepStrictEqual(players.map(player => player.gamertag), ['Current One', 'Current Two']);
+  assert(players.every(player => player.evidence_kind === 'authoritative'));
+
+  const mismatched = await fetchOnlinePlayers(51, '9002', 3, null, queryPool, {
+    platform: 'pc',
+    token: 'test-token',
+    playerService,
+  });
+  assert.deepStrictEqual(mismatched, [], 'PC provider names must match the live provider count');
+
+  const duplicateIds = await fetchOnlinePlayers(52, '9003', 2, null, queryPool, {
+    platform: 'pc',
+    token: 'test-token',
+    playerService: {
+      listPlayers: async () => [
+        { id: 'same', name: 'First', online: true },
+        { id: 'same', name: 'Second', online: true },
+      ],
+    },
+  });
+  assert.deepStrictEqual(duplicateIds, [], 'PC provider identities must be unique');
+
+  const invalidNames = await fetchOnlinePlayers(53, '9004', 2, null, queryPool, {
+    platform: 'pc',
+    token: 'test-token',
+    playerService: {
+      listPlayers: async () => [
+        { id: '', name: 'Missing ID', online: true },
+        { id: 'steam-4', name: 'Unknown', online: true },
+      ],
+    },
+  });
+  assert.deepStrictEqual(invalidNames, [], 'PC provider rows require valid identities and names');
+
+  let missingCredentialCalls = 0;
+  const missingCredentials = await fetchOnlinePlayers(54, '9005', 1, null, queryPool, {
+    platform: 'pc',
+    playerService: {
+      listPlayers: async () => { missingCredentialCalls += 1; return []; },
+    },
+  });
+  assert.deepStrictEqual(missingCredentials, []);
+  assert.strictEqual(missingCredentialCalls, 0, 'missing PC credentials must fail before provider access');
+
+  let consoleProviderCalls = 0;
+  await fetchOnlinePlayers(55, '9006', 1, Date.now() - 1000, {
+    query: async () => ({ rows: [] }),
+  }, {
+    platform: 'xbox',
+    token: 'test-token',
+    playerService: {
+      listPlayers: async () => { consoleProviderCalls += 1; return []; },
+    },
+  });
+  assert.strictEqual(consoleProviderCalls, 0, 'console names must never use the provider player API');
+}
+
 async function testOnlinePlayerEvidenceRequiresNormalizedServerStart() {
   assert.strictEqual(
     providerStatusChangeMs('1788302121'),
@@ -422,6 +506,7 @@ async function main() {
   testStatusEmbedExplainsUnavailablePlayerNames();
   testStatusEmbedLabelsEstimatedNamesWithLastSeenTimes();
   await testOnlinePlayerEvidenceIsExactServerRestartScopedAndCountMatched();
+  await testPcOnlinePlayersUseAuthoritativeProviderList();
   await testOnlinePlayerEvidenceRequiresNormalizedServerStart();
   testMissingEvidenceWarningsIgnoreEmptyServersAndAreRateLimited();
   testOnlineCacheUsesTheCurrentAdmGamertag();

@@ -13,6 +13,7 @@ const {
   normalizeNitradoFilePath,
   resolveOperationalServers,
   selectLogSyncBatch,
+  syncLatestAdmForExactServer,
   validateLogFileEntry,
 } = require('../services/logSyncService');
 const { compareLogFileEntries, logStartTimeMs } = require('../utils/logFileChronology');
@@ -70,6 +71,80 @@ async function scanAdmOnlyForTest(guildId) {
     systemAuthorizedInternalServerId: 1,
     sourceObservedAt: new Date().toISOString(),
   });
+}
+
+async function testLowLatencyAdmUsesLiveConsolePathDialect() {
+  const cases = [
+    {
+      platformServerId: '101',
+      game: 'dayzxb',
+      gamePath: '/games/account/noftp/dayzxb/',
+      rootName: 'dayzxb',
+      rootPath: '/games/account/ftproot/dayzxb',
+      expectedConfigPath: '/games/account/noftp/dayzxb/config',
+      filename: 'DayZServerP_X1_x64_2026-09-13_10-33-21.ADM',
+    },
+    {
+      platformServerId: '102',
+      game: 'dayzstandalone',
+      gamePath: '/games/account/ftproot/dayzstandalone/',
+      rootName: 'dayzstandalone',
+      rootPath: '/games/account/ftproot/dayzstandalone',
+      expectedConfigPath: '/games/account/ftproot/dayzstandalone/config',
+      filename: 'DayZServer_x64_2026-09-13_10-33-21.ADM',
+    },
+  ];
+
+  for (const fixture of cases) {
+    const requestedUrls = [];
+    const downloaded = [];
+    const result = await syncLatestAdmForExactServer(null, 42, 'token', {
+      authorizeServer: async () => ({
+        id: 42,
+        platformServerId: fixture.platformServerId,
+        guildDiscordId: '900000000000000001',
+      }),
+      getRawGameserver: async () => ({
+        service_id: fixture.platformServerId,
+        game: fixture.game,
+        game_specific: { path: fixture.gamePath },
+      }),
+      httpGet: async url => {
+        requestedUrls.push(String(url));
+        if (!String(url).includes('/file_server/list?dir=')) {
+          return {
+            data: {
+              status: 'success',
+              data: { entries: [{ type: 'dir', name: fixture.rootName, path: fixture.rootPath }] },
+            },
+          };
+        }
+        return {
+          data: {
+            status: 'success',
+            data: { entries: [{
+              type: 'file',
+              name: fixture.filename,
+              path: `${fixture.rootPath}/config/${fixture.filename}`,
+              size: 100,
+              modified_at: 1789321156,
+            }] },
+          },
+        };
+      },
+      downloadFile: async (_token, _serverId, entry) => {
+        downloaded.push(entry.name);
+        return false;
+      },
+    });
+
+    assert(
+      requestedUrls.some(url => url.includes(encodeURIComponent(fixture.expectedConfigPath))),
+      `${fixture.game} low-latency listing must use its live provider path dialect`
+    );
+    assert.deepStrictEqual(downloaded, [fixture.filename]);
+    assert.strictEqual(result.admFiles[0].name, fixture.filename);
+  }
 }
 
 function testRotatedLogWithDifferentSizeIsUpdated() {
@@ -840,7 +915,7 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
     requestedUrls.push(String(url));
     const serverId = String(url).match(/services\/(\d+)/)?.[1];
     const dataDirectory = serverId === '102' ? 'dayzstandalone' : 'dayzxb';
-    const dialect = serverId === '102' ? 'ftproot' : 'noftp';
+    const dialect = 'ftproot';
     if (String(url).includes('/file_server/list?dir=')) {
       return {
         data: {
@@ -929,6 +1004,7 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
 
   try {
     for (const sync of [syncService.performLogSync, syncService.performLogSyncConcurrent]) {
+      requestedUrls.length = 0;
       fs.rmSync(path.join(__dirname, '..', 'downloads', guildId), { recursive: true, force: true });
       const result = await sync(db, 7, 'test-token', ['101', '102', '999']);
       assert.strictEqual(result.totalFilesDownloaded, 2);
@@ -944,6 +1020,16 @@ async function testSerialAndConcurrentSyncStayServerScoped() {
       assert.ok(result.errors.some(error => /Server 999/.test(error)));
       assert.strictEqual(result.serverLogPaths['101'], null);
       assert.strictEqual(result.serverLogPaths['102'], null);
+      const consoleConfigPath = encodeURIComponent('/games/101/noftp/dayzxb/config');
+      assert.ok(
+        requestedUrls.some(url => url.includes(`/services/101/gameservers/file_server/list?dir=${consoleConfigPath}`)),
+        'console log sync must list the live noftp alias when Nitrado returns an ftproot path'
+      );
+      const staleConsoleConfigPath = encodeURIComponent('/games/101/ftproot/dayzxb/config');
+      assert.ok(
+        !requestedUrls.some(url => url.includes(`/services/101/gameservers/file_server/list?dir=${staleConsoleConfigPath}`)),
+        'console log sync must not also list the stale ftproot alias'
+      );
       const pcConfigPath = encodeURIComponent('/games/102/ftproot/dayzstandalone/config');
       assert.ok(
         requestedUrls.some(url => url.includes(`/services/102/gameservers/file_server/list?dir=${pcConfigPath}`)),
@@ -2186,7 +2272,7 @@ function testScannerPersistenceUsesExactInternalServerId() {
     /saveCleanupEvents\(db, serverId,[^;]+serverContext\.id\)/,
     /refreshPlayerServerActivity\(db, serverId, serverContext\.id\)/,
     /saveHealthUpdates\(db, serverId,[^;]+serverContext\.id\)/,
-    /updateOnlineCache\([\s\S]*?db,[\s\S]*?serverId,[\s\S]*?serverContext\.id,[\s\S]*?latestSourceObservedAt[\s\S]*?\)/,
+    /updateOnlineCache\([\s\S]*?db,[\s\S]*?serverId,[\s\S]*?serverContext\.id,[\s\S]*?normalizedSourceObservedAt[\s\S]*?\)/,
   ];
   for (const callPattern of exactCalls) {
     assert.match(scanner, callPattern,
@@ -2488,7 +2574,10 @@ function testProviderModifiedAtNormalizesOnlineCacheObservation() {
 }
 
 function testProviderClockNormalizesLatestAdmPositions() {
-  const { normalizeLatestAdmPositionTimestamps } = require('../routes/logParser');
+  const {
+    normalizeLatestAdmPositionTimestamps,
+    normalizeOnlinePlayerLoginTimestamps,
+  } = require('../routes/logParser');
   const snapshots = [
     { platformUserId: 'CURRENT', timestamp: '2026-09-05T16:52:50.000Z' },
     { platformUserId: 'OLDER', timestamp: '2026-09-05T15:52:50.000Z' },
@@ -2506,6 +2595,37 @@ function testProviderClockNormalizesLatestAdmPositions() {
     '2026-09-05T16:52:50.000Z',
     '2026-09-05T15:52:50.000Z',
   ], 'clock normalization must not mutate parser output shared with other event consumers');
+
+  const onlinePlayers = [{
+    platformUserId: 'PLAYER',
+    playerGamertag: 'Survivor',
+    loginAt: '2026-09-13T13:55:07.000Z',
+  }];
+  const normalizedOnlinePlayers = normalizeOnlinePlayerLoginTimestamps(
+    onlinePlayers,
+    '2026-09-13T14:10:07.000Z',
+    '2026-09-13T18:10:07.000Z'
+  );
+  assert.strictEqual(
+    normalizedOnlinePlayers[0].loginAt,
+    '2026-09-13T17:55:07.000Z',
+    'provider UTC evidence must correct console login times without replacing their relative age'
+  );
+  assert.strictEqual(
+    onlinePlayers[0].loginAt,
+    '2026-09-13T13:55:07.000Z',
+    'online login-time normalization must not mutate parser state'
+  );
+  assert.deepStrictEqual(
+    normalizeOnlinePlayerLoginTimestamps(
+      onlinePlayers,
+      '2026-09-13T14:00:00.000Z',
+      '2026-09-13T18:43:36.000Z'
+    ),
+    onlinePlayers,
+    'non-timezone-sized differences must not make stale online sessions current'
+  );
+
   assert.deepStrictEqual(
     normalizeLatestAdmPositionTimestamps(
       snapshots,
@@ -3047,6 +3167,7 @@ async function testEqualTimestampOnlineCacheUsesMonotonicScanGeneration() {
 }
 
 async function main() {
+  await testLowLatencyAdmUsesLiveConsolePathDialect();
   testRotatedLogWithDifferentSizeIsUpdated();
   testSameSizeProviderLogIsStillRefreshed();
   testSyncClassificationRejectsDestinationSymlinks();

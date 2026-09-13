@@ -737,6 +737,37 @@ function testEconomyConflictRequiresSuccessfulReloadBeforeControlsEnable() {
     'save controls must remain disabled until conflict reload succeeds');
 }
 
+function testRequestLoggingSuppressesRoutineAssetNoise() {
+  const { shouldLogRequest } = require('../utils/requestLogPolicy');
+
+  for (const request of [
+    { method: 'GET', path: '/maps/chernarusplus/tiles/1/2.png' },
+    { method: 'GET', path: '/js/dashboard.js' },
+    { method: 'HEAD', path: '/css/app.css' },
+    { method: 'GET', path: '/favicon.ico' },
+    { method: 'GET', path: '/health' },
+  ]) {
+    assert.strictEqual(shouldLogRequest(request), false,
+      `${request.method} ${request.path} should not create routine request-log noise`);
+  }
+
+  for (const request of [
+    { method: 'GET', path: '/api/servers' },
+    { method: 'GET', path: '/api/maps/export.png' },
+    { method: 'GET', path: '/API/maps/export.png' },
+    { method: 'GET', path: '/AuTh/discord/callback.png' },
+    { method: 'GET', path: '/dashboard' },
+    { method: 'POST', path: '/maps/chernarusplus/tiles/1/2.png' },
+  ]) {
+    assert.strictEqual(shouldLogRequest(request), true,
+      `${request.method} ${request.path} should remain observable`);
+  }
+
+  const middleware = read('src/app/registerMiddleware.js');
+  assert.doesNotMatch(middleware, /Host detected:|Player portal detected!|Admin portal \(or main site\)/,
+    'host/subdomain classification must not be logged on every request');
+}
+
 function testProductionReleaseGuardrails() {
   const ci = read('.github/workflows/ci.yml');
   const compose = read('docker-compose.yml');
@@ -754,6 +785,21 @@ function testProductionReleaseGuardrails() {
   assert.match(ci, /npm run security:audit/, 'CI must execute the repository secret scanner');
   assert.match(ci, /node --check scripts\/release-ready-checks\.js/, 'CI must syntax-check the public release-check entry point');
   assert.doesNotMatch(compose, /["']?5432:5432["']?/, 'production Compose must not publish PostgreSQL');
+  assert.match(
+    compose,
+    /x-logging:\s*&bounded-json-logging[\s\S]*?driver:\s*json-file[\s\S]*?max-size:\s*["']10m["'][\s\S]*?max-file:\s*["']3["']/,
+    'production Compose must define bounded json-file logging'
+  );
+  for (const serviceName of ['backend', 'bot']) {
+    const serviceBlock = compose.match(new RegExp(`^  ${serviceName}:([\\s\\S]*?)(?=^  [a-z][a-z0-9-]*:|^volumes:)`, 'm'))?.[1] || '';
+    assert.match(serviceBlock, /logging:\s*\*bounded-json-logging/,
+      `${serviceName} must use bounded Docker logging`);
+  }
+  for (const serviceName of ['postgres', 'db-init', 'tui']) {
+    const serviceBlock = compose.match(new RegExp(`^  ${serviceName}:([\\s\\S]*?)(?=^  [a-z][a-z0-9-]*:|^volumes:)`, 'm'))?.[1] || '';
+    assert.doesNotMatch(serviceBlock, /logging:/,
+      `${serviceName} must remain outside the code-only backend/bot logging rollout`);
+  }
   assert.match(dockerfile, /^FROM node:22/m);
   assert(
     dockerfile.indexOf('COPY . .') < dockerfile.indexOf('RUN npm run build:css'),
@@ -963,6 +1009,7 @@ testPostgresCreateRoutesReturnInsertedRows();
 testSelfHostedRuntimeModesAndPublicUrls();
 testEconomyStatsRejectsStaleServerResponses();
 testEconomyConflictRequiresSuccessfulReloadBeforeControlsEnable();
+testRequestLoggingSuppressesRoutineAssetNoise();
 testProductionReleaseGuardrails();
 testDevcontainerResolvesWithoutUntrackedEnvironment();
 testDocReviewFailsClosedOnInvalidRefsAndAcceptsRepositoryPatterns();

@@ -1764,7 +1764,12 @@ async function publishExactServerOnlineSnapshot(
     throw new Error('Incremental online snapshot is invalid');
   }
   const context = await resolveContext(db, internalServerId, platformServerId, token);
-  const players = snapshot.players.map(player => ({
+  const normalizedSnapshotPlayers = normalizeOnlinePlayerLoginTimestamps(
+    snapshot.players,
+    snapshot.observedAt,
+    sourceObservedAt
+  );
+  const players = normalizedSnapshotPlayers.map(player => ({
     playerName: player.playerGamertag,
     platformUserId: player.platformUserId,
     dpnid: null,
@@ -1782,7 +1787,7 @@ async function publishExactServerOnlineSnapshot(
   return updateCache(
     db,
     platformServerId,
-    snapshot.players,
+    normalizedSnapshotPlayers,
     context.platform,
     context.id,
     sourceObservedAt,
@@ -3797,33 +3802,53 @@ function normalizeSourceObservedAt(parsedSourceObservedAt, providerSourceObserve
   return parsedMs !== null ? new Date(parsedMs).toISOString() : null;
 }
 
-function normalizeLatestAdmPositionTimestamps(positionSnapshots, parsedSourceObservedAt,
+function normalizeAdmRecordTimestamps(records, timestampField, parsedSourceObservedAt,
   providerSourceObservedAt) {
   const parsedMs = parseStrictTimestampMs(parsedSourceObservedAt);
   const providerIso = normalizeSourceObservedAt(null, providerSourceObservedAt);
   const providerMs = providerIso ? Date.parse(providerIso) : null;
-  if (parsedMs === null || providerMs === null) return positionSnapshots;
+  if (parsedMs === null || providerMs === null) return records;
 
   const hourMs = 60 * 60 * 1000;
   const offsetMs = Math.round((providerMs - parsedMs) / hourMs) * hourMs;
   const residualMs = providerMs - parsedMs - offsetMs;
   if (offsetMs < 0 || offsetMs > 14 * hourMs
       || residualMs < 0 || residualMs > 15 * 60 * 1000) {
-    return positionSnapshots;
+    return records;
   }
 
   const normalized = [];
-  for (const snapshot of positionSnapshots) {
-    const timestampMs = parseStrictTimestampMs(snapshot.timestamp);
+  for (const record of records) {
+    const timestampMs = parseStrictTimestampMs(record[timestampField]);
     if (timestampMs === null) {
-      normalized.push(snapshot);
+      normalized.push(record);
       continue;
     }
     const normalizedTimestampMs = timestampMs + offsetMs;
-    if (normalizedTimestampMs > providerMs) return positionSnapshots;
-    normalized.push({ ...snapshot, timestamp: new Date(normalizedTimestampMs).toISOString() });
+    if (normalizedTimestampMs > providerMs) return records;
+    normalized.push({ ...record, [timestampField]: new Date(normalizedTimestampMs).toISOString() });
   }
   return normalized;
+}
+
+function normalizeLatestAdmPositionTimestamps(positionSnapshots, parsedSourceObservedAt,
+  providerSourceObservedAt) {
+  return normalizeAdmRecordTimestamps(
+    positionSnapshots,
+    'timestamp',
+    parsedSourceObservedAt,
+    providerSourceObservedAt
+  );
+}
+
+function normalizeOnlinePlayerLoginTimestamps(players, parsedSourceObservedAt,
+  providerSourceObservedAt) {
+  return normalizeAdmRecordTimestamps(
+    players,
+    'loginAt',
+    parsedSourceObservedAt,
+    providerSourceObservedAt
+  );
 }
 
 /**
@@ -4128,13 +4153,19 @@ async function scanLogsForServer(db, userId, serverId, token, {
   // This correctly handles players who connected in an earlier log file and are
   // still online — they won't have a connect event in the last file, so
   // looking only at the last file would miss them.
+  const normalizedSourceObservedAt = normalizeSourceObservedAt(latestSourceObservedAt, sourceObservedAt);
+  const normalizedOnlinePlayers = normalizeOnlinePlayerLoginTimestamps(
+    Array.from(onlinePlayersMap.values()),
+    latestSourceObservedAt,
+    sourceObservedAt
+  );
   const onlineCachePublished = await updateOnlineCache(
     db,
     serverId,
-    Array.from(onlinePlayersMap.values()),
+    normalizedOnlinePlayers,
     platform,
     serverContext.id,
-    normalizeSourceObservedAt(latestSourceObservedAt, sourceObservedAt),
+    normalizedSourceObservedAt,
     scanGeneration
   );
 
@@ -4169,6 +4200,7 @@ module.exports.updateOnlineCache = updateOnlineCache;
 module.exports.publishExactServerOnlineSnapshot = publishExactServerOnlineSnapshot;
 module.exports.normalizeSourceObservedAt = normalizeSourceObservedAt;
 module.exports.normalizeLatestAdmPositionTimestamps = normalizeLatestAdmPositionTimestamps;
+module.exports.normalizeOnlinePlayerLoginTimestamps = normalizeOnlinePlayerLoginTimestamps;
 module.exports.findLogFile = findLogFile;
 module.exports.findAllLogFiles = findAllLogFiles;
 module.exports.streamLogLines = streamLogLines;

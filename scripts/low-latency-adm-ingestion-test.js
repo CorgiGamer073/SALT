@@ -483,11 +483,11 @@ async function testExactServerSnapshotPublisherPersistsThenReplacesCache() {
   const db = {};
   const snapshot = {
     sourceFileName: 'current.ADM',
-    observedAt: '2026-09-13T12:00:00Z',
+    observedAt: '2026-09-13T14:00:00Z',
     players: [{
       playerGamertag: 'Current Player',
       platformUserId: 'AAAA1111',
-      loginAt: '2026-09-13T12:00:00Z',
+      loginAt: '2026-09-13T13:55:00Z',
     }],
   };
   await publishExactServerOnlineSnapshot(
@@ -496,7 +496,7 @@ async function testExactServerSnapshotPublisherPersistsThenReplacesCache() {
     'exact-token',
     41,
     snapshot,
-    '2026-09-13T12:00:05.000Z',
+    '2026-09-13T18:00:05.000Z',
     {
       resolveContext: async (...args) => {
         calls.push(['resolve', ...args]);
@@ -531,11 +531,11 @@ async function testExactServerSnapshotPublisherPersistsThenReplacesCache() {
     [{
       playerGamertag: 'Current Player',
       platformUserId: 'AAAA1111',
-      loginAt: '2026-09-13T12:00:00Z',
+      loginAt: '2026-09-13T17:55:00.000Z',
     }],
     'xbox',
     41,
-    '2026-09-13T12:00:05.000Z',
+    '2026-09-13T18:00:05.000Z',
     712,
   ]);
 }

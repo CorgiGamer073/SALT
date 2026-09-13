@@ -296,6 +296,13 @@ function isLogArtifactName(name) {
   return typeof name === 'string' && /\.(ADM|RPT)$/i.test(name);
 }
 
+function configListPathForStructure(structure) {
+  const rawConfigPath = structure.configPath.replace(/\/+$/, '');
+  return structure.platform === 'pc'
+    ? rawConfigPath
+    : normalizeNitradoFilePath(rawConfigPath);
+}
+
 function getLogSyncConfigEntries(response) {
   const entries = response?.data?.data?.entries;
   if (response?.data?.status !== 'success' || !Array.isArray(entries)) {
@@ -591,7 +598,7 @@ async function performLogSync(db, userId, token, serverIds, {
         continue;
       }
       availabilityTracker.recordAvailable(serverId);
-      const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
+      const configPathOnProvider = configListPathForStructure(structure);
       const configListRes = await http.get(`https://api.nitrado.net/services/${serverId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`, { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 });
       const configEntries = getLogSyncConfigEntries(configListRes);
       const configFiles = configEntries.validatedOtherEntries
@@ -780,7 +787,7 @@ async function performLogSyncConcurrent(
           return;
         }
         availabilityTracker.recordAvailable(serverId);
-        const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
+        const configPathOnProvider = configListPathForStructure(structure);
         const configListRes = await http.get(`https://api.nitrado.net/services/${serverId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`, { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 });
 
         const configEntries = getLogSyncConfigEntries(configListRes);
@@ -918,7 +925,7 @@ async function syncLatestAdmForExactServer(db, serverId, token, {
   const structure = inspectNitradoRootEntries(getNitradoFileEntries(listRes), gameserver);
   if (!structure.configPath) throw new ProviderLogStorageUnavailableError(platformServerId);
 
-  const configPathOnProvider = structure.configPath.replace(/\/+$/, '');
+  const configPathOnProvider = configListPathForStructure(structure);
   const configListRes = await httpGet(
     `https://api.nitrado.net/services/${platformServerId}/gameservers/file_server/list?dir=${encodeURIComponent(configPathOnProvider)}`,
     { headers: { Authorization: 'Bearer ' + token }, timeout: 10000 }

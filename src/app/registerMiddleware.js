@@ -17,6 +17,7 @@ const { encryptToken } = require('../../utils/encryption');
 const { getPublicConfig, isPlayerPortalHost } = require('../../utils/publicConfig');
 const { apiLimiter, apiMutationLimiter, authLimiter } = require('../../middleware/rateLimiter');
 const { requestAbortMiddleware } = require('../../utils/requestAbort');
+const { shouldLogRequest } = require('../../utils/requestLogPolicy');
 const {
   reconcileConfiguredDashboardOwner,
 } = require('../../services/dashboardOwnerBootstrapService');
@@ -167,24 +168,16 @@ function registerMiddleware(app, db, csrfProtection) {
   app.use(passport.initialize());
   app.use(passport.session());
 
-  // Request logger. Never log cookies or session identifiers.
+  // Keep dynamic requests observable without logging high-volume static assets.
   app.use((req, res, next) => {
-    console.log(`\n📨 ${req.method} ${req.path}`);
+    if (shouldLogRequest(req)) console.log(`\n📨 ${req.method} ${req.path}`);
     next();
   });
 
   // Subdomain detection
   app.use((req, res, next) => {
     const host = req.get('host');
-    console.log(`   🌐 Host detected: ${host}`);
-
-    if (isPlayerPortalHost(host, publicConfig)) {
-      req.isPlayerPortal = true;
-      console.log(`   🎮 Player portal detected!`);
-    } else {
-      console.log(`   🔧 Admin portal (or main site)`);
-    }
-
+    if (isPlayerPortalHost(host, publicConfig)) req.isPlayerPortal = true;
     next();
   });
 

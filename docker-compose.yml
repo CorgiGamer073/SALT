@@ -1,3 +1,9 @@
+x-logging: &bounded-json-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -42,6 +48,7 @@ services:
       - ./data:/app/data
       - ./bin:/app/bin
     restart: unless-stopped
+    logging: *bounded-json-logging
     depends_on:
       db-init:
         condition: service_completed_successfully
@@ -58,6 +65,7 @@ services:
     volumes:
       - ./downloads:/app/downloads
     restart: unless-stopped
+    logging: *bounded-json-logging
     depends_on:
       postgres:
         condition: service_healthy

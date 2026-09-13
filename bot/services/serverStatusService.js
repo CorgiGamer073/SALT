@@ -732,7 +732,12 @@ async function fetchOnlinePlayers(
   platformServerId = null,
   livePlayerCount = null,
   serverStartedAtMs = null,
-  queryPool = pool
+  queryPool = pool,
+  {
+    platform = 'unknown',
+    token = null,
+    playerService = nitradoService,
+  } = {}
 ) {
   try {
     const reportedPlayerCount = Number.isInteger(livePlayerCount) && livePlayerCount > 0
@@ -742,6 +747,38 @@ async function fetchOnlinePlayers(
       missingPlayerEvidenceWarnings.delete(String(serverDbId));
       return [];
     }
+
+    if (platform === 'pc') {
+      if (!token || !platformServerId) {
+        console.warn(`⚠️  fetchOnlinePlayers(server_db_id=${serverDbId}): PC provider credentials are unavailable`);
+        return [];
+      }
+      const providerPlayers = await playerService.listPlayers(token, platformServerId);
+      const onlinePlayers = providerPlayers.filter(player => player?.online === true);
+      const validPlayers = onlinePlayers.filter(player => {
+        const id = String(player?.id || '').trim();
+        const name = String(player?.name || '').trim();
+        return id && name && name.toLowerCase() !== 'unknown';
+      });
+      const uniqueIds = new Set(validPlayers.map(player => String(player.id).trim()));
+      if (
+        onlinePlayers.length !== reportedPlayerCount
+        || validPlayers.length !== onlinePlayers.length
+        || uniqueIds.size !== validPlayers.length
+      ) {
+        console.warn(`⚠️  fetchOnlinePlayers(server_db_id=${serverDbId}): PC provider player list did not match the live count`);
+        return [];
+      }
+      missingPlayerEvidenceWarnings.delete(String(serverDbId));
+      return validPlayers.map(player => ({
+        gamertag: String(player.name).trim(),
+        login_at: null,
+        updated_at: new Date(),
+        last_seen_at: new Date(),
+        evidence_kind: 'authoritative',
+      }));
+    }
+
     if (!Number.isFinite(serverStartedAtMs)) {
       logMissingOnlinePlayerEvidence(serverDbId, reportedPlayerCount);
       return [];
@@ -1150,7 +1187,13 @@ async function updateGuild(client, guildRow, { updateVoiceChannels = true } = {}
     server_db_id,
     platform_server_id,
     Number.isInteger(gameserver.query?.player_current) ? gameserver.query.player_current : null,
-    providerStatusChangeMs(gameserver.last_status_change)
+    providerStatusChangeMs(gameserver.last_status_change),
+    pool,
+    {
+      platform: detectDayzPlatform(gameserver),
+      token,
+      playerService: nitradoService,
+    }
   );
 
   // Get sync timing info from automation_settings
